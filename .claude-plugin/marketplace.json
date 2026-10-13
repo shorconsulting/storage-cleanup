@@ -1,0 +1,15 @@
+{
+  "name": "storage-cleanup",
+  "description": "Storage Cleanup: free disk across every git checkout on a shared Mac and tidy GitHub.",
+  "owner": {
+    "name": "David Shor",
+    "url": "https://github.com/shorconsulting"
+  },
+  "plugins": [
+    {
+      "name": "storage-cleanup",
+      "source": "./",
+      "description": "Frees disk across every git checkout (merged worktrees and branches, idle build output, caches, stray Claude worktrees) and tidies GitHub branches, Actions caches and artifacts; test mode reports only."
+    }
+  ]
+}

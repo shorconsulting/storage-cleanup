@@ -1,0 +1,20 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (throwaway git repositories, fake GitHub; no network)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v

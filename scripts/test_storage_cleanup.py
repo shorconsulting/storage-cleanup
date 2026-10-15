@@ -91,7 +91,8 @@ class Fixture(unittest.TestCase):
     """A bare origin, a clone of it with an initial commit on main, and helpers to add worktrees."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="sc-test-"))
+        # realpath: macOS hands out /var/folders/..., which the script resolves to /private/var/folders/...
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="sc-test-")))
         self.origin = self.tmp / "origin.git"
         sh(self.tmp, "init", "-q", "--bare", "-b", "main", str(self.origin))
         self.repo = self.tmp / "home" / "claude" / "app"
@@ -415,7 +416,7 @@ class OtherAccounts(Fixture):
         Path(self.repo, "node_modules").mkdir()
         age(self.repo / ".git", 30 * 86400)
         real = sc.current_user
-        sc.current_user = lambda: "aiuser1"
+        sc.current_user = lambda: "sc-test-other-account"  # never the account running the tests
         try:
             plan = self.plan()
         finally:
@@ -492,6 +493,211 @@ class BuildOutput(Fixture):
         self.assertTrue((self.repo / "build" / "keep.txt").exists())
         self.assertTrue((self.repo / ".env").exists())
         self.assertTrue((self.repo / "secrets").exists())
+
+
+def age_tree(path, seconds):
+    """Back-date every file and folder under path (and path itself)."""
+    t = time.time() - seconds
+    for root, dirs, files in os.walk(str(path)):
+        for n in dirs + files:
+            os.utime(os.path.join(root, n), (t, t), follow_symlinks=False)
+    os.utime(str(path), (t, t))
+
+
+class Elsewhere(Fixture):
+    """What AI sessions leave outside the checkouts: orphaned worktree folders, session temp folders, crash dumps,
+    throwaway test databases, tool caches."""
+
+    def setUp(self):
+        super().setUp()
+        self._open = sc.open_by_process
+        sc.open_by_process = lambda p: False  # lsof is not on every CI runner; its own test patches it back
+
+    def tearDown(self):
+        sc.open_by_process = self._open
+        super().tearDown()
+
+    def orphan(self, name, branch):
+        path = self.tmp / "stray" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sh(self.repo, "worktree", "add", "-q", "-b", branch, str(path))
+        subprocess.run(["rm", "-rf", str(self.repo / ".git" / "worktrees" / name)], check=True)
+        Path(path, "package.json").write_text("{}")
+        (path / "node_modules" / "pkg").mkdir(parents=True)
+        Path(path, "node_modules", "pkg", "index.js").write_text("x" * 5000)
+        (path / "dist").mkdir()  # never source in a checkout, but git cannot say so for an orphan: kept
+        Path(path, "dist", "app.js").write_text("x")
+        Path(path, "notes.txt").write_text("unsaved work")
+        return path
+
+    def build(self, **over):
+        c = sc.load_config()
+        c.update(homes=[], roots=[str(self.tmp / "stray")], tempRoots=[], postgres=[], crashDays=0)
+        c.update(over)
+        args = sc.argparse.Namespace(home=None, local_only=True, remote_only=False, no_caches=True)
+        return sc.build_plan(args, c, None)[0]
+
+    def test_husky_shims_do_not_keep_a_merged_worktree(self):
+        wt = self.worktree("hooks", "agent/hooks")
+        (wt / ".husky").mkdir()
+        commit(wt, ".husky/pre-commit", "npx lint-staged")  # the hook itself is tracked, its shims are not
+        (wt / ".husky" / "_").mkdir(parents=True)
+        Path(wt, ".husky", "_", ".gitignore").write_text("*\n")  # what husky writes on npm install
+        Path(wt, ".husky", "_", "h").write_text("#!/bin/sh")
+        sh(self.repo, "merge", "-q", "--ff-only", "agent/hooks")
+        sh(self.repo, "push", "-q", "origin", "main")
+        age(self.repo / ".git" / "worktrees" / "hooks", 13 * 3600)
+        self.assertEqual(self.targets(self.plan(), "worktree"), [str(wt)])
+        self.cfg["disposableIgnored"] = []
+        self.assertIn(".husky/_", self.kept(self.plan(), "worktree")[str(wt)])
+
+    def test_an_orphan_loses_its_build_output_when_idle_and_the_folder_only_much_later(self):
+        o = self.orphan("o1", "agent/o1")
+        plan = self.build()
+        self.assertEqual([x["path"] for x in plan.loose], [str(o)])
+        self.assertEqual(self.targets(plan, "build") + self.targets(plan, "orphan"), [])  # just changed
+        age_tree(o, 10 * 86400)
+        plan = self.build()
+        self.assertEqual(self.targets(plan, "build"), [str(o / "node_modules")])
+        self.assertEqual(self.targets(plan, "orphan"), [])
+        sc.execute(plan)
+        self.assertFalse((o / "node_modules").exists())
+        self.assertTrue((o / "dist" / "app.js").exists())
+        self.assertEqual((o / "notes.txt").read_text(), "unsaved work")
+        age_tree(o, 31 * 86400)
+        plan = self.build()
+        self.assertEqual(self.targets(plan, "orphan"), [str(o)])
+        sc.execute(plan)
+        self.assertFalse(o.exists())
+
+    def test_an_orphan_with_a_recent_edit_a_nested_repository_or_an_open_file_stays(self):
+        edited = self.orphan("o2", "agent/o2")
+        nested = self.orphan("o3", "agent/o3")
+        sh(nested, "init", "-q", str(nested / "vendor-clone"))
+        age_tree(edited, 40 * 86400)
+        age_tree(nested, 40 * 86400)
+        Path(edited, "notes.txt").write_text("edited today")
+        plan = self.build()
+        self.assertEqual(self.targets(plan, "orphan"), [])
+        self.assertEqual(self.kept(plan, "orphan")[str(nested)], "holds a nested git repository")
+        never = self.build(orphanWorktreeDays=0)
+        self.assertEqual(self.targets(never, "orphan"), [])
+        lone = self.orphan("o4", "agent/o4")
+        age_tree(lone, 40 * 86400)
+        plan = self.build()
+        self.assertEqual(self.targets(plan, "orphan"), [str(lone)])
+        sc.open_by_process = lambda p: True
+        sc.execute(plan)
+        self.assertTrue(lone.exists())
+        self.assertIn("open", [a for a in plan.actions if a["kind"] == "orphan"][0]["detail"])
+
+    def session(self, root, sid, age_days):
+        p = root / "-Users-me-proj" / sid
+        (p / "scratchpad" / "pg").mkdir(parents=True)
+        Path(p, "scratchpad", "pg", "base.dat").write_text("x" * 5000)
+        (p / "tasks").mkdir()
+        Path(p, "tasks", "a.output").write_text("log")
+        age_tree(p, age_days * 86400)
+        return p
+
+    def test_idle_session_temp_folders_go_and_live_ones_stay(self):
+        root = self.tmp / "claude-501"
+        old = self.session(root, "11111111-2222-3333-4444-555555555555", 4)
+        fresh = self.session(root, "22222222-2222-3333-4444-555555555555", 1)
+        db = self.session(root, "33333333-2222-3333-4444-555555555555", 4)
+        Path(db, "scratchpad", "pg", "postmaster.pid").write_text(f"{os.getpid()}\n/tmp\n")
+        age_tree(db, 4 * 86400)  # a database started days ago and idle since: its pid file is old too
+        withwt = self.session(root, "44444444-2222-3333-4444-555555555555", 4)
+        sh(self.repo, "worktree", "add", "-q", "-b", "agent/in-temp", str(withwt / "scratchpad" / "wt"))
+        age_tree(withwt, 4 * 86400)
+        (root / "node22" / "bin").mkdir(parents=True)  # not a session folder: never removed
+        age_tree(root / "node22", 30 * 86400)
+        c = sc.load_config()
+        c.update(tempRoots=[str(root)])
+        plan = sc.Plan()
+        sc.plan_temp(c, plan, set(), time.time(), "me")
+        self.assertEqual(self.targets(plan, "temp"), [str(old)])
+        kept = self.kept(plan, "temp")
+        self.assertIn("postmaster.pid", kept[str(db)])
+        self.assertIn("git checkout", kept[str(withwt)])
+        self.assertNotIn(str(fresh), kept)
+        sc.execute(plan)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists() and db.exists() and withwt.exists() and (root / "node22").exists())
+
+    def test_a_session_folder_written_after_the_plan_stays(self):
+        root = self.tmp / "claude-502"
+        s = self.session(root, "55555555-2222-3333-4444-555555555555", 5)
+        c = sc.load_config()
+        c.update(tempRoots=[str(root)])
+        plan = sc.Plan()
+        sc.plan_temp(c, plan, set(), time.time(), "me")
+        self.assertEqual(self.targets(plan, "temp"), [str(s)])
+        Path(s, "tasks", "a.output").write_text("the session came back")
+        sc.execute(plan)
+        self.assertTrue(s.exists())
+
+    def test_old_crash_reports_go_and_recent_ones_and_settings_stay(self):
+        home = self.tmp / "crashhome"
+        base = (home / "Library" / "Application Support" / "Codex" / "Crashpad" if sys.platform == "darwin"
+                else home / ".config" / "Codex" / "Crashpad")
+        (base / "completed").mkdir(parents=True)
+        old, new, settings = base / "completed" / "a.dmp", base / "completed" / "b.dmp", base / "settings.dat"
+        for p in (old, new, settings):
+            p.write_bytes(b"x" * (2 * 1024 * 1024))
+        t = time.time() - 10 * 86400
+        os.utime(str(old), (t, t))
+        os.utime(str(settings), (t, t))
+        real = sc.all_homes
+        sc.all_homes = lambda: {os.path.realpath(str(home))}
+        try:
+            plan = sc.Plan()
+            sc.plan_crash(sc.load_config(), {"name": "me", "path": home}, "me", plan, time.time())
+            self.assertEqual(self.targets(plan, "crash"), [str(base)])
+            sc.execute(plan)
+        finally:
+            sc.all_homes = real
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists() and settings.exists())
+
+    def test_idle_unconnected_test_databases_are_planned_and_others_kept(self):
+        data = self.tmp / "pgdata"
+        for oid in ("101", "102", "103"):
+            (data / "base" / oid).mkdir(parents=True)
+            Path(data, "base", oid, "1259").write_text("x")
+        age_tree(data / "base" / "101", 3 * 86400)
+        age_tree(data / "base" / "102", 3 * 86400)
+        rows = [("101", "rr_old", 50 * 1024 * 1024, 0), ("102", "rr_busy", 1, 2), ("103", "rr_fresh", 1, 0)]
+        c = sc.load_config()
+        c["postgres"] = [{"host": "/tmp", "port": 5999, "dataDir": str(data), "match": ["rr_%"], "idleDays": 2}]
+        plan = sc.Plan()
+        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows)
+        self.assertEqual(self.targets(plan, "database"), ["/tmp:5999 rr_old"])
+        self.assertIn("connection", self.kept(plan, "database")["/tmp:5999 rr_busy"])
+        c["postgres"][0]["dataDir"] = str(self.tmp / "missing")
+        plan = sc.Plan()
+        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows)
+        self.assertEqual(self.targets(plan, "database"), [])
+        self.assertTrue(any("not readable" in n for n in plan.notes))
+
+    def test_tool_caches_without_a_command_are_emptied_unless_the_tool_runs(self):
+        home = self.tmp / "cachehome"
+        (home / ".gradle" / "caches" / "modules-2").mkdir(parents=True)
+        Path(home, ".gradle", "caches", "modules-2", "jar").write_text("x" * 5000)
+        c = sc.load_config()
+        c.update(cacheMinMB=0, caches={k: k == "gradle" for k in sc.load_config()["caches"]})
+        real = sc.running
+        try:
+            sc.running = lambda p: False
+            plan = sc.Plan()
+            sc.plan_caches(c, {"name": "me", "path": home}, "me", plan)
+            self.assertEqual(self.targets(plan, "cache"), [str(home / ".gradle" / "caches" / "modules-2")])
+            sc.running = lambda p: True
+            plan = sc.Plan()
+            sc.plan_caches(c, {"name": "me", "path": home}, "me", plan)
+            self.assertEqual(self.targets(plan, "cache"), [])
+        finally:
+            sc.running = real
 
 
 class DeleteGuard(Fixture):

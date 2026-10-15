@@ -75,10 +75,14 @@ is written to `~/.claude/storage-cleanup/out/storage-cleanup.html` to open in a 
 | Local branches                            | merged by the same rule                                                                                                                                                                                                | default branch, `main`, `master`, `develop`, `release/*`, `hotfix/*`, `laravel-dev`, ...             |
 | Build output                              | git-ignored `node_modules`, `dist`, `build`, `coverage`, `.turbo`, `.vite`, `.next`, `playwright-report`, `test-results`, `__pycache__`, `target`, ... in a checkout idle 7 days                                       | tracked files, `.env` or anything not in the list                                                    |
 | Git upkeep                                | `git worktree prune`; `git gc` when loose objects exceed 100 MB                                                                                                                                                        |                                                                                                      |
-| Caches (running account)                  | npm, pnpm, yarn 1, pip, Homebrew when at least 200 MB; Playwright revisions beyond the newest two per browser; docker build cache older than a week and dangling images                                                | docker images in use, volumes                                                                        |
+| Caches (running account)                  | npm, pnpm, yarn 1, pip, Homebrew, Gradle caches, Xcode DerivedData, Puppeteer when at least 200 MB; Playwright revisions beyond the newest two per browser; simulators whose runtime is gone; docker build cache older than a week and dangling images | docker images in use, volumes; Gradle or Xcode caches while that tool runs                          |
 | Remote branches                           | PR merged at least 1 day ago, or closed unmerged at least 30 days ago, and no push since it closed                                                                                                                     | an open PR's head or base (stacked PRs), protected or default branches, branches that never had a PR |
 | Actions caches                            | of a closed PR or a deleted branch                                                                                                                                                                                     | the default branch's                                                                                 |
 | Actions artifacts                         | older than 14 days                                                                                                                                                                                                     |                                                                                                      |
+| Orphaned worktree folders                 | git no longer knows the folder: `node_modules` (beside a `package.json`), `.turbo`, `.next`, `coverage`, `__pycache__`, ... after 7 days with no file changed; the whole folder after 30 days (`orphanWorktreeDays`, 0 = never) | a file changed since the plan, a process with a file in it open, a nested repository, another account's files |
+| Claude temp folders                       | `<tempRoot>/<project>/<session id>/` after 3 days with no file changed (`tempIdleDays`)                                                                                                                                | a process running in it, a live `*.pid` file in it (a test database), a git checkout in it, any other folder of the temp root |
+| Crash reports                             | files older than 7 days (`crashDays`) in apps' `Crashpad` / `Crash Reports` folders and `~/Library/Logs/DiagnosticReports`                                                                                             | `settings.dat`, `metadata`                                                                           |
+| Test databases                            | on the clusters under `postgres` in the config: a matching database with no connection and no write for `idleDays`                                                                                                     | `keep` patterns, a database connected or written since the plan; never `WITH (FORCE)`               |
 
 ## Stray worktrees
 
@@ -93,9 +97,32 @@ lives.
   runs in it, its uncommitted files were not edited in those 12 h either, it is not locked or mid-rebase, and the running account owns it. A name already taken gets `-2`, `-3`.
   `.claude/worktrees/` is added to the checkout's local `.git/info/exclude` when the checkout does not ignore it
   already, so the main checkout's `git status` stays clean. `worktreeHome: ""` in the config turns moving off.
-- A folder that looks like a worktree but whose checkout no longer knows it (git's record of it was pruned) is an
-  orphan. It may hold unsaved work the script cannot read through git, so it is only listed, with its size and last
-  change, under **Loose worktree folders**: check it and delete it by hand.
+- A folder that looks like a worktree but whose checkout no longer knows it (git's record of it was pruned, or the
+  checkout itself was deleted) is an orphan. Its commits went with git's record, so only its files are left. It is
+  listed under **Orphaned worktree folders**; its build output goes once no file in it has changed for 7 days, and
+  the folder itself once no file has changed for 30 days (`orphanWorktreeDays`; 0 keeps them for good). Only build
+  folder names that are never source go early (`orphanBuildDirs`: git can no longer say what is ignored), and
+  `node_modules` only beside a `package.json`.
+- Git-ignored folders a tool regenerates (`disposableIgnored`, by default husky's `.husky/_` hook shims) no longer
+  keep a merged worktree the way an `.env` does.
+
+## Other places AI sessions leave things
+
+- **Claude temp folders.** Each session keeps a folder under `/private/tmp/claude-<uid>/<project>/<session id>/`
+  (scratchpad, task output); agents put test databases, clones and downloads there. One goes when no file in it has
+  changed for 3 days (`tempIdleDays`), nothing runs in it, no live `*.pid` file is in it and it holds no git
+  checkout (worktrees there follow the worktree rules). Anything else in the temp root of 500 MB or more is reported
+  only: a tool an agent installed there may still be run from it without anything being written.
+- **Crash reports.** Electron and Chromium apps (Claude, Codex, Slack, Chrome, VS Code) write crash dumps into a
+  `Crashpad` folder that is never emptied; one held 25 GB on 15 Oct 2026. Files older than 7 days go (`crashDays`).
+- **Throwaway test databases.** Test scripts create a database per worktree and never drop it. List each cluster
+  under `postgres` in the config (`psql`, `host`, `port`, `user`, `dataDir`, `match`, optional `keep`,
+  `idleDays`); a matching database with no connection whose files in `dataDir/base/<oid>` were not written for
+  `idleDays` is dropped, without `FORCE`, after both are checked again just before the drop.
+- **Reported, never touched.** The Trash when it holds 1 GB or more. When the disk is over 85% full, the number of
+  Time Machine local snapshots: they keep every deleted file, so deleting frees nothing until macOS thins them or
+  `sudo tmutil deletelocalsnapshots /` is run in Terminal (it needs the password; backups on a Time Machine drive
+  stay).
 
 Remote cleanup runs only for repositories owned by `homeporthealth`, `Velocity-Org`, `Shor-Consulting-Inc` and
 `shorconsulting`, where the `gh` login has push access; other remotes (for example the legacy repositories) get
@@ -163,7 +190,8 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 
 `~/.claude/storage-cleanup/config.json` overrides any default (`storage_cleanup.py config init` writes the file
 with every default; `config show` prints the effective one). Keys: `homes`, `roots`, `skipDirs`, `maxDepth`,
-`worktreeIdleHours`, `worktreeHome`, `tempRoots`, `staleWorktreeDays`, `repoIdleDays`, `buildDirs`, `protectBranches`, `caches`, `cacheMinMB`,
+`worktreeIdleHours`, `worktreeHome`, `tempRoots`, `staleWorktreeDays`, `repoIdleDays`, `buildDirs`, `disposableIgnored`,
+`orphanBuildDirs`, `orphanWorktreeDays`, `tempIdleDays`, `crashDays`, `postgres`, `protectBranches`, `caches`, `cacheMinMB`,
 `playwrightKeep`, `remoteOwners`, `remote` (`branches`, `mergedGraceDays`, `closedGraceDays`, `actionsCaches`,
 `artifacts`, `artifactDays`).
 

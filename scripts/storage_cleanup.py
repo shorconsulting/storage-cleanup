@@ -807,7 +807,8 @@ HARMLESS_IGNORED = {".DS_Store", "Thumbs.db"}
 
 def segments_match(parts: list, pattern: str) -> bool:
     """`parts` (a path split on /) is the pattern's path or lies inside it, matched one segment at a time, so a
-    `*` never spans a `/`: `.husky/_` covers `.husky/_/h`, `local*` does not cover `local-settings/secrets.json`."""
+    `*` never spans a `/`. A pattern that matches a folder covers everything in it: `.husky/_` covers `.husky/_/h`,
+    and `local*` would cover `local-settings/secrets.json` too, so keep patterns to folders a tool rebuilds whole."""
     pat = [p for p in pattern.strip("/").split("/") if p]
     return bool(pat) and len(parts) >= len(pat) and all(fnmatch.fnmatchcase(a, b) for a, b in zip(parts, pat))
 
@@ -1225,7 +1226,8 @@ def open_by_process(path: Path) -> bool:
     sees only this account's processes. Fails closed: no lsof, a timeout or an error counts as in use."""
     if not have("lsof"):
         return True
-    rc, out, _ = run(["lsof", "-t", "+D", str(path)], timeout=600)
+    is_dir = Path(path).is_dir() and not Path(path).is_symlink()
+    rc, out, _ = run(["lsof", "-t", "+D", str(path)] if is_dir else ["lsof", "-t", "--", str(path)], timeout=600)
     if out.strip():
         return True
     return rc not in (0, 1)  # lsof exits 1 when it finds nothing
@@ -1263,7 +1265,10 @@ def repository_inside(path: Path, own_dotgit: bool = False) -> str | None:
         top_dev = os.lstat(str(path)).st_dev
     except OSError:
         return "unreadable"
-    for root, dirs, files in os.walk(str(path), onerror=lambda e: None):
+    unreadable: list = []
+    for root, dirs, files in os.walk(str(path), onerror=lambda e: unreadable.append(e.filename)):
+        if unreadable:
+            return f"{unreadable[0]} (unreadable)"  # fail closed: a delete would stop half way
         names = set(dirs) | set(files)
         for marker in (".git", ".hg", ".jj"):
             if marker in names and not (own_dotgit and marker == ".git" and root == str(path)):
@@ -1283,7 +1288,7 @@ def repository_inside(path: Path, own_dotgit: bool = False) -> str | None:
                 return f"{p} (a mounted filesystem)"
             keep.append(d)
         dirs[:] = keep
-    return None
+    return f"{unreadable[0]} (unreadable)" if unreadable else None
 
 
 def orphan_gitdir_missing(path: Path) -> bool:
@@ -1510,7 +1515,8 @@ def plan_temp(cfg: dict, plan: Plan, cwds: set, now: float, me: str) -> None:
                     plan.need(owner_of(Path(other)), f"Claude temp folder {label}")
                     continue
                 plan.add("temp", label, du_bytes(p), f"Claude session temp folder, nothing changed for "
-                         f"{idle_text(idle_d)}", lambda x=p, n=newest, r=root, c=cwds: _remove_temp(x, n, r, c), me)
+                         f"{idle_text(idle_d)}", lambda x=p, n=newest, r=root, c=cwds, pr=top.name, d=days:
+                         _remove_temp(x, n, r, c, pr, d), me)
 
 
 def temp_refusal(p: Path, root: Path, cwds: set) -> str | None:
@@ -1525,9 +1531,11 @@ def temp_refusal(p: Path, root: Path, cwds: set) -> str | None:
     return refuse_tree(p, [root])
 
 
-def _remove_temp(p: Path, newest: float, root: Path, cwds: set) -> tuple:
+def _remove_temp(p: Path, newest: float, root: Path, cwds: set, project: str = "", days: float = 0) -> tuple:
     if newest_change(p) > newest:
         return False, "kept: something in it changed since the plan was made"
+    if project and session_alive(project, p.name, time.time(), days, process_args()):
+        return False, "kept: its session was resumed since the plan was made"
     why = temp_refusal(p, root, cwds)
     if why:
         return False, f"refused: {why}"
@@ -1909,8 +1917,7 @@ def build_plan(args: argparse.Namespace, cfg: dict, gh: GitHub | None, extra_slu
     roots = [(h["name"], h["path"]) for h in homes]
     roots += [("", Path(os.path.expanduser(r))) for r in cfg.get("roots", [])]
     if not only or me in only:  # Claude's temp folders of the running account: where stray worktrees end up
-        uid = os.getuid() if hasattr(os, "getuid") else 0
-        roots += [(me, Path(r.replace("{uid}", str(uid)))) for r in cfg.get("tempRoots", [])]
+        roots += [(me, r) for r in temp_roots(cfg)]  # real, private folders this account owns only
     walked, worktree_dirs = set(), []
     for name, root in roots:
         if not exists(root) or not root.is_dir() or os.path.realpath(str(root)) in walked:

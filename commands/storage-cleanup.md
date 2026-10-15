@@ -58,13 +58,27 @@ never delete anything yourself. The script decides what is safe; your job is to 
   merges included). A worktree whose work is only pushed goes after 14 idle days and its branch is kept.
 - **Stray worktrees**: Claude's temp folders (`/private/tmp/claude-<uid>`) are searched too. A worktree outside its
   checkout that has to stay (uncommitted or unmerged work) is moved into `<checkout>/.claude/worktrees/<name>` with
-  `git worktree move` once idle and unused. A worktree folder git no longer knows is listed under `Loose worktree
-folders`, never moved or deleted.
+  `git worktree move` once idle and unused.
+- **Orphaned worktree folders** (git no longer knows them; the checkout may be gone, moved or unplugged): listed
+  under `Orphaned worktree folders`, and only their `node_modules` and similar build folders go, after 7 days with
+  nothing changed. The folders themselves stay unless `orphanWorktreeDays` is set.
+- **Claude temp folders**: a session's folder under `/private/tmp/claude-<uid>/<project>/<session id>/` (scratchpad,
+  task output) after 7 days with nothing changed and its session transcript unchanged as long, unless a process runs
+  in it or names the session, a live `*.pid` file (a test database) is in it, or it holds a repository or mount.
+  Other folders in the temp root are only reported.
+- **Crash reports**: files older than 7 days in apps' `Crashpad` / `Crash Reports` folders and macOS
+  `DiagnosticReports`.
+- **Test databases**: on the Postgres clusters listed under `postgres` in the config, matching databases with no
+  connection and no write for `idleDays` are dropped (never `WITH (FORCE)`).
 - **Local branches**: deleted only when merged by the same rule; protected names and the default branch never.
 - **Build output**: git-ignored `node_modules`, `dist`, `coverage`, `.turbo`, `.next`, `playwright-report` and the
   like, in checkouts idle for 7 days. Never `.env`, never tracked files. `npm ci` brings them back.
 - **Caches** (the running account only, each when at least 200 MB): npm, pnpm, yarn 1, pip, Homebrew, Playwright
-  browser revisions beyond the newest two, docker build cache older than a week and dangling images.
+  browser revisions beyond the newest two, docker build cache older than a week and dangling images, Gradle caches
+  and Xcode DerivedData (not while Gradle, gradlew, Xcode or xcodebuild runs).
+- **Reported, never touched**: the Trash (1 GB or more), iOS simulators (1 GB or more), and Time Machine local
+  snapshots when the disk is over 85% full; snapshots keep deleted files, so space comes back only when macOS thins
+  them or after `sudo tmutil deletelocalsnapshots /`.
 - **Remote** (owners in `remoteOwners`, push access via `gh`): branches whose PR merged at least 1 day ago or closed
   unmerged at least 30 days ago, untouched since; never a branch an open PR uses as head or base, never protected
   branches, never a branch with no PR. Actions caches of closed PRs and deleted branches; artifacts older than

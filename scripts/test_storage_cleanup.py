@@ -504,17 +504,30 @@ def age_tree(path, seconds):
     os.utime(str(path), (t, t))
 
 
+def mtime_newest(path, skip=frozenset()):
+    """newest_change without ctime: a test can back-date mtimes but never ctimes, so the rule tests read this."""
+    best = 0.0
+    for root, dirs, files in os.walk(str(path)):
+        dirs[:] = [d for d in dirs if d not in skip and not os.path.islink(os.path.join(root, d))]
+        for n in files:
+            best = max(best, os.lstat(os.path.join(root, n)).st_mtime)
+    return best
+
+
 class Elsewhere(Fixture):
     """What AI sessions leave outside the checkouts: orphaned worktree folders, session temp folders, crash dumps,
     throwaway test databases, tool caches."""
 
     def setUp(self):
         super().setUp()
-        self._open = sc.open_by_process
+        self._saved = (sc.open_by_process, sc.newest_change, sc.CLAUDE_PROJECTS, sc.process_args)
         sc.open_by_process = lambda p: False  # lsof is not on every CI runner; its own test patches it back
+        sc.newest_change = mtime_newest
+        sc.CLAUDE_PROJECTS = self.tmp / "projects"
+        sc.process_args = lambda: ""
 
     def tearDown(self):
-        sc.open_by_process = self._open
+        sc.open_by_process, sc.newest_change, sc.CLAUDE_PROJECTS, sc.process_args = self._saved
         super().tearDown()
 
     def orphan(self, name, branch):
@@ -551,8 +564,10 @@ class Elsewhere(Fixture):
         self.cfg["disposableIgnored"] = []
         self.assertIn(".husky/_", self.kept(self.plan(), "worktree")[str(wt)])
 
-    def test_an_orphan_loses_its_build_output_when_idle_and_the_folder_only_much_later(self):
+    def test_an_orphan_loses_its_build_output_when_idle_and_the_folder_only_when_set(self):
         o = self.orphan("o1", "agent/o1")
+        (o / "src" / "coverage").mkdir(parents=True)  # a source folder that happens to share a build name
+        Path(o, "src", "coverage", "policy.ts").write_text("export const plan = 1")
         plan = self.build()
         self.assertEqual([x["path"] for x in plan.loose], [str(o)])
         self.assertEqual(self.targets(plan, "build") + self.targets(plan, "orphan"), [])  # just changed
@@ -563,9 +578,14 @@ class Elsewhere(Fixture):
         sc.execute(plan)
         self.assertFalse((o / "node_modules").exists())
         self.assertTrue((o / "dist" / "app.js").exists())
+        self.assertTrue((o / "src" / "coverage" / "policy.ts").exists())
         self.assertEqual((o / "notes.txt").read_text(), "unsaved work")
         age_tree(o, 31 * 86400)
-        plan = self.build()
+        self.assertEqual(self.targets(self.build(), "orphan"), [])  # the folder itself: report only by default
+        Path(o, "src", "coverage", "policy.ts").write_text("edited today")  # inside a build-named folder: counts
+        self.assertEqual(self.targets(self.build(orphanWorktreeDays=30), "orphan"), [])
+        age_tree(o, 31 * 86400)
+        plan = self.build(orphanWorktreeDays=30)
         self.assertEqual(self.targets(plan, "orphan"), [str(o)])
         sc.execute(plan)
         self.assertFalse(o.exists())
@@ -577,14 +597,12 @@ class Elsewhere(Fixture):
         age_tree(edited, 40 * 86400)
         age_tree(nested, 40 * 86400)
         Path(edited, "notes.txt").write_text("edited today")
-        plan = self.build()
+        plan = self.build(orphanWorktreeDays=30)
         self.assertEqual(self.targets(plan, "orphan"), [])
-        self.assertEqual(self.kept(plan, "orphan")[str(nested)], "holds a nested git repository")
-        never = self.build(orphanWorktreeDays=0)
-        self.assertEqual(self.targets(never, "orphan"), [])
+        self.assertIn("holds a repository", self.kept(plan, "orphan")[str(nested)])
         lone = self.orphan("o4", "agent/o4")
         age_tree(lone, 40 * 86400)
-        plan = self.build()
+        plan = self.build(orphanWorktreeDays=30)
         self.assertEqual(self.targets(plan, "orphan"), [str(lone)])
         sc.open_by_process = lambda p: True
         sc.execute(plan)
@@ -592,6 +610,8 @@ class Elsewhere(Fixture):
         self.assertIn("open", [a for a in plan.actions if a["kind"] == "orphan"][0]["detail"])
 
     def session(self, root, sid, age_days):
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(root), 0o700)  # Claude's temp root is private to its account; any other is refused
         p = root / "-Users-me-proj" / sid
         (p / "scratchpad" / "pg").mkdir(parents=True)
         Path(p, "scratchpad", "pg", "base.dat").write_text("x" * 5000)
@@ -602,14 +622,20 @@ class Elsewhere(Fixture):
 
     def test_idle_session_temp_folders_go_and_live_ones_stay(self):
         root = self.tmp / "claude-501"
-        old = self.session(root, "11111111-2222-3333-4444-555555555555", 4)
-        fresh = self.session(root, "22222222-2222-3333-4444-555555555555", 1)
-        db = self.session(root, "33333333-2222-3333-4444-555555555555", 4)
+        old = self.session(root, "11111111-2222-3333-4444-555555555555", 8)
+        fresh = self.session(root, "22222222-2222-3333-4444-555555555555", 4)
+        db = self.session(root, "33333333-2222-3333-4444-555555555555", 8)
         Path(db, "scratchpad", "pg", "postmaster.pid").write_text(f"{os.getpid()}\n/tmp\n")
-        age_tree(db, 4 * 86400)  # a database started days ago and idle since: its pid file is old too
-        withwt = self.session(root, "44444444-2222-3333-4444-555555555555", 4)
+        age_tree(db, 8 * 86400)  # a database started days ago and idle since: its pid file is old too
+        withwt = self.session(root, "44444444-2222-3333-4444-555555555555", 8)
         sh(self.repo, "worktree", "add", "-q", "-b", "agent/in-temp", str(withwt / "scratchpad" / "wt"))
-        age_tree(withwt, 4 * 86400)
+        age_tree(withwt, 8 * 86400)
+        bare = self.session(root, "66666666-2222-3333-4444-555555555555", 8)
+        sh(bare, "init", "-q", "--bare", str(bare / "scratchpad" / "origin.git"))  # the only copy of its pushes
+        age_tree(bare, 8 * 86400)
+        resumable = self.session(root, "77777777-2222-3333-4444-555555555555", 8)
+        (self.tmp / "projects" / "-Users-me-proj").mkdir(parents=True)
+        Path(self.tmp, "projects", "-Users-me-proj", "77777777-2222-3333-4444-555555555555.jsonl").write_text("{}")
         (root / "node22" / "bin").mkdir(parents=True)  # not a session folder: never removed
         age_tree(root / "node22", 30 * 86400)
         c = sc.load_config()
@@ -619,15 +645,54 @@ class Elsewhere(Fixture):
         self.assertEqual(self.targets(plan, "temp"), [str(old)])
         kept = self.kept(plan, "temp")
         self.assertIn("postmaster.pid", kept[str(db)])
-        self.assertIn("git checkout", kept[str(withwt)])
+        self.assertIn("holds a repository", kept[str(withwt)])
+        self.assertIn("holds a repository", kept[str(bare)])
+        self.assertIn("used recently", kept[str(resumable)])
         self.assertNotIn(str(fresh), kept)
         sc.execute(plan)
         self.assertFalse(old.exists())
-        self.assertTrue(fresh.exists() and db.exists() and withwt.exists() and (root / "node22").exists())
+        self.assertTrue(all(p.exists() for p in (fresh, db, withwt, bare, resumable, root / "node22")))
+
+    def test_a_temp_root_that_is_a_symlink_or_open_to_others_is_not_cleaned(self):
+        real = self.tmp / "projects-elsewhere"
+        s = self.session(real, "88888888-2222-3333-4444-555555555555", 30)
+        link = self.tmp / "claude-503"
+        link.symlink_to(real)
+        c = sc.load_config()
+        c.update(tempRoots=[str(link)])
+        self.assertEqual(sc.temp_roots(c), [])
+        os.chmod(str(real), 0o755)
+        c.update(tempRoots=[str(real)])
+        self.assertEqual(sc.temp_roots(c), [])
+        self.assertTrue(s.exists())
+
+    def test_a_copy_that_kept_old_times_counts_as_a_change(self):
+        src = self.tmp / "orig"
+        src.mkdir()
+        Path(src, "a.txt").write_text("x")
+        age_tree(src, 90 * 86400)
+        self.assertLess(mtime_newest(src), time.time() - 80 * 86400)
+        self.assertGreater(self._saved[1](src), time.time() - 60)  # the real newest_change reads ctime too
+
+    def test_the_whole_folder_guard(self):
+        home = self.tmp / "h"
+        (home / "work").mkdir(parents=True)
+        (home / ".claude" / "projects" / "p").mkdir(parents=True)
+        (home / "work" / "app").mkdir()
+        real = sc.all_homes
+        sc.all_homes = lambda: {os.path.realpath(str(home))}
+        try:
+            self.assertEqual(sc.refuse_tree(home / "work", []), "a folder directly in a home")
+            self.assertEqual(sc.refuse_tree(home / ".claude" / "projects" / "p", []), "inside ~/.claude")
+            self.assertIsNone(sc.refuse_tree(home / "work" / "app", []))
+            (home / "work" / "ln").symlink_to(home / "work" / "app")
+            self.assertEqual(sc.refuse_tree(home / "work" / "ln", []), "a symlink")
+        finally:
+            sc.all_homes = real
 
     def test_a_session_folder_written_after_the_plan_stays(self):
         root = self.tmp / "claude-502"
-        s = self.session(root, "55555555-2222-3333-4444-555555555555", 5)
+        s = self.session(root, "55555555-2222-3333-4444-555555555555", 9)
         c = sc.load_config()
         c.update(tempRoots=[str(root)])
         plan = sc.Plan()
@@ -670,15 +735,42 @@ class Elsewhere(Fixture):
         rows = [("101", "rr_old", 50 * 1024 * 1024, 0), ("102", "rr_busy", 1, 2), ("103", "rr_fresh", 1, 0)]
         c = sc.load_config()
         c["postgres"] = [{"host": "/tmp", "port": 5999, "dataDir": str(data), "match": ["rr_%"], "idleDays": 2}]
+        rows.append(("104", "rr_elsewhere", 1, 0))  # no folder under base: another tablespace, never 'idle'
+        same = lambda cc: str(data)  # noqa: E731
         plan = sc.Plan()
-        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows)
+        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows, datadir=same)
         self.assertEqual(self.targets(plan, "database"), ["/tmp:5999 rr_old"])
         self.assertIn("connection", self.kept(plan, "database")["/tmp:5999 rr_busy"])
+        self.assertIn("tablespace", self.kept(plan, "database")["/tmp:5999 rr_elsewhere"])
+        plan = sc.Plan()  # dataDir names another cluster than the one psql reached
+        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows, datadir=lambda cc: "/elsewhere")
+        self.assertEqual(self.targets(plan, "database"), [])
         c["postgres"][0]["dataDir"] = str(self.tmp / "missing")
         plan = sc.Plan()
-        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows)
+        sc.plan_postgres(c, plan, time.time(), "me", query=lambda cc: rows, datadir=same)
         self.assertEqual(self.targets(plan, "database"), [])
         self.assertTrue(any("not readable" in n for n in plan.notes))
+
+    def test_database_names_cannot_forge_a_row_and_patterns_are_literal_about_underscores(self):
+        def hexname(n):
+            return n.encode().hex()
+        out = "\n".join(f"{o}\t{hexname(n)}\t1\t0" for o, n in (
+            ("16384", "rr_one"), ("16385", "rr_dev\n16400\tranch_rides_dev"), ("16386", "rrXone"),
+            ("16387", "rr_keep"), ("16388", "ranch_rides_dev")))
+        real = sc.pg_run
+        sc.pg_run = lambda c, sql: (0, out + "\n", "")
+        try:
+            rows = sc.pg_databases({"match": ["rr\\_%"], "keep": ["rr\\_keep"]})
+        finally:
+            sc.pg_run = real
+        self.assertEqual([r[1] for r in rows], ["rr_one"])
+        self.assertTrue(sc.like("rrXone", "rr_one") and not sc.like("rrXone", "rr\\_one"))
+
+    def test_disposable_patterns_never_span_a_slash(self):
+        self.assertTrue(sc.segments_match([".husky", "_", "h"], ".husky/_"))
+        self.assertFalse(sc.segments_match(["local-settings", "secrets.json"], "local*/x"))
+        self.assertTrue(sc.segments_match(["local-settings"], "local*"))
+        self.assertFalse(sc.segments_match([".husky"], ".husky/_"))
 
     def test_tool_caches_without_a_command_are_emptied_unless_the_tool_runs(self):
         home = self.tmp / "cachehome"

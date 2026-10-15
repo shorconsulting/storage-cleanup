@@ -44,9 +44,11 @@ Then `python3 ~/storage_cleanup.py clean --all-accounts` from an administrator a
 | `... --all-accounts`                          | Also run as each other account through `sudo -u`; one summary for all                          |
 | `... --where`                                 | Also list the largest folders of each home (slow on big homes)                                 |
 
-Nothing outside git checkouts and the named tool caches is ever deleted. The delete step itself refuses a home
-folder, anything directly in one (`~/Music`, `~/Documents`, `~/work`), anything in a personal folder outside a known
-cache, any folder that is not build output inside a git checkout, and any folder holding a nested git repository (a clone or worktree under an ignored folder, whose unpushed work the outer checkout cannot see). `--where` only measures folders, to show where
+Outside git checkouts and the named tool caches, only three kinds of thing are ever deleted, each with its own rule
+below: a Claude session's own temp folder, old crash dumps, and test databases on a cluster the config names. Every
+delete refuses a home folder, anything directly in one (`~/Music`, `~/Documents`, `~/work`), anything in a personal
+folder outside a known cache or crash folder, anything under `~/.claude`, a symlink, and any folder holding a
+repository (`.git`, `.hg`, `.jj`, or a bare repository) or a mounted filesystem. `--where` only measures folders, to show where
 the space went. A test run deletes and moves nothing; it does refresh each checkout's remote-tracking refs
 (`git fetch --prune`) and writes its own report files.
 
@@ -75,12 +77,12 @@ is written to `~/.claude/storage-cleanup/out/storage-cleanup.html` to open in a 
 | Local branches                            | merged by the same rule                                                                                                                                                                                                | default branch, `main`, `master`, `develop`, `release/*`, `hotfix/*`, `laravel-dev`, ...             |
 | Build output                              | git-ignored `node_modules`, `dist`, `build`, `coverage`, `.turbo`, `.vite`, `.next`, `playwright-report`, `test-results`, `__pycache__`, `target`, ... in a checkout idle 7 days                                       | tracked files, `.env` or anything not in the list                                                    |
 | Git upkeep                                | `git worktree prune`; `git gc` when loose objects exceed 100 MB                                                                                                                                                        |                                                                                                      |
-| Caches (running account)                  | npm, pnpm, yarn 1, pip, Homebrew, Gradle caches, Xcode DerivedData, Puppeteer when at least 200 MB; Playwright revisions beyond the newest two per browser; simulators whose runtime is gone; docker build cache older than a week and dangling images | docker images in use, volumes; Gradle or Xcode caches while that tool runs                          |
+| Caches (running account)                  | npm, pnpm, yarn 1, pip, Homebrew, Gradle caches, Xcode DerivedData when at least 200 MB; Playwright revisions beyond the newest two per browser; docker build cache older than a week and dangling images | docker images in use, volumes; Gradle or Xcode caches while Gradle, gradlew, Xcode or xcodebuild runs (checked again just before each entry goes) |
 | Remote branches                           | PR merged at least 1 day ago, or closed unmerged at least 30 days ago, and no push since it closed                                                                                                                     | an open PR's head or base (stacked PRs), protected or default branches, branches that never had a PR |
 | Actions caches                            | of a closed PR or a deleted branch                                                                                                                                                                                     | the default branch's                                                                                 |
 | Actions artifacts                         | older than 14 days                                                                                                                                                                                                     |                                                                                                      |
-| Orphaned worktree folders                 | git no longer knows the folder: `node_modules` (beside a `package.json`), `.turbo`, `.next`, `coverage`, `__pycache__`, ... after 7 days with no file changed; the whole folder after 30 days (`orphanWorktreeDays`, 0 = never) | a file changed since the plan, a process with a file in it open, a nested repository, another account's files |
-| Claude temp folders                       | `<tempRoot>/<project>/<session id>/` after 3 days with no file changed (`tempIdleDays`)                                                                                                                                | a process running in it, a live `*.pid` file in it (a test database), a git checkout in it, any other folder of the temp root |
+| Orphaned worktree folders                 | git no longer knows the folder: its `node_modules` (beside a `package.json`), `.turbo`, `.next`, `__pycache__`, ... after 7 days with nothing changed. The folder itself is only reported, unless `orphanWorktreeDays` is set | a change since the plan (mtime or ctime), a checkout on `/Volumes`, a repository or mount inside, another account's files |
+| Claude temp folders                       | `<tempRoot>/<project>/<session id>/` after 7 days with nothing changed (`tempIdleDays`), and its session's transcript unchanged as long and no process naming the session | a process running in it, a live `*.pid` file in it (a test database), a repository or mount in it, a temp root that is a symlink or open to other accounts, any other folder of the temp root |
 | Crash reports                             | files older than 7 days (`crashDays`) in apps' `Crashpad` / `Crash Reports` folders and `~/Library/Logs/DiagnosticReports`                                                                                             | `settings.dat`, `metadata`                                                                           |
 | Test databases                            | on the clusters under `postgres` in the config: a matching database with no connection and no write for `idleDays`                                                                                                     | `keep` patterns, a database connected or written since the plan; never `WITH (FORCE)`               |
 
@@ -97,28 +99,40 @@ lives.
   runs in it, its uncommitted files were not edited in those 12 h either, it is not locked or mid-rebase, and the running account owns it. A name already taken gets `-2`, `-3`.
   `.claude/worktrees/` is added to the checkout's local `.git/info/exclude` when the checkout does not ignore it
   already, so the main checkout's `git status` stays clean. `worktreeHome: ""` in the config turns moving off.
-- A folder that looks like a worktree but whose checkout no longer knows it (git's record of it was pruned, or the
-  checkout itself was deleted) is an orphan. Its commits went with git's record, so only its files are left. It is
-  listed under **Orphaned worktree folders**; its build output goes once no file in it has changed for 7 days, and
-  the folder itself once no file has changed for 30 days (`orphanWorktreeDays`; 0 keeps them for good). Only build
-  folder names that are never source go early (`orphanBuildDirs`: git can no longer say what is ignored), and
-  `node_modules` only beside a `package.json`.
+- A folder that looks like a worktree but whose checkout no longer knows it is an orphan. The checkout may be
+  deleted, or only moved or on an unplugged drive (then `git worktree repair` reconnects it), so the folder may hold
+  the only copy of unsaved work. It is listed under **Orphaned worktree folders** and only its build output goes,
+  once nothing in it has changed for 7 days: folder names that are never source (`orphanBuildDirs`: git can no
+  longer say what is ignored), and `node_modules` only beside a `package.json`. "Changed" reads ctime as well as
+  mtime, so a copy or move that kept old times counts as new. Setting `orphanWorktreeDays` also removes the folder
+  itself after that many days, except a checkout on `/Volumes`, a folder holding a repository or mount, or one
+  holding another account's files.
 - Git-ignored folders a tool regenerates (`disposableIgnored`, by default husky's `.husky/_` hook shims) no longer
   keep a merged worktree the way an `.env` does.
 
 ## Other places AI sessions leave things
 
 - **Claude temp folders.** Each session keeps a folder under `/private/tmp/claude-<uid>/<project>/<session id>/`
-  (scratchpad, task output); agents put test databases, clones and downloads there. One goes when no file in it has
-  changed for 3 days (`tempIdleDays`), nothing runs in it, no live `*.pid` file is in it and it holds no git
-  checkout (worktrees there follow the worktree rules). Anything else in the temp root of 500 MB or more is reported
-  only: a tool an agent installed there may still be run from it without anything being written.
+  (scratchpad, task output); agents put test databases, clones and downloads there. One goes when nothing in it has
+  changed for 7 days (`tempIdleDays`), its session's transcript (`~/.claude/projects/<project>/<session id>.jsonl`)
+  has not changed for as long, no process names the session, nothing runs in it, no live `*.pid` file is in it and
+  it holds no repository or mount (worktrees there follow the worktree rules). The temp root must be a real folder
+  the running account owns that no other account may enter. Anything else in the temp root of 500 MB or more is
+  reported only: a tool an agent installed there may still be run from it without anything being written.
+- **Simulators.** Reported only when they hold 1 GB or more: which ones `xcrun simctl delete unavailable` would remove
+  depends on the selected Xcode.
+- **Other accounts' processes.** Run without root, `lsof` and the process list show only the running account's
+  processes. Claude temp roots are private to their account, and orphaned folders are only reported by default,
+  which is why that is enough; turning `orphanWorktreeDays` on for folders other accounts use is not safe.
 - **Crash reports.** Electron and Chromium apps (Claude, Codex, Slack, Chrome, VS Code) write crash dumps into a
   `Crashpad` folder that is never emptied; one held 25 GB on 15 Oct 2026. Files older than 7 days go (`crashDays`).
 - **Throwaway test databases.** Test scripts create a database per worktree and never drop it. List each cluster
   under `postgres` in the config (`psql`, `host`, `port`, `user`, `dataDir`, `match`, optional `keep`,
   `idleDays`); a matching database with no connection whose files in `dataDir/base/<oid>` were not written for
-  `idleDays` is dropped, without `FORCE`, after both are checked again just before the drop.
+  `idleDays` is dropped, without `FORCE`, after both are checked again just before the drop. `match` and `keep` are
+  SQL LIKE patterns: `_` matches any one character, so write `rr\_%` for names starting `rr_`. The run checks the
+  cluster's own `data_directory` is `dataDir` (else it skips the cluster), keeps a database whose files are not under
+  `dataDir/base` (another tablespace), and reads names hex-encoded so no name can pass for another.
 - **Reported, never touched.** The Trash when it holds 1 GB or more. When the disk is over 85% full, the number of
   Time Machine local snapshots: they keep every deleted file, so deleting frees nothing until macOS thins them or
   `sudo tmutil deletelocalsnapshots /` is run in Terminal (it needs the password; backups on a Time Machine drive

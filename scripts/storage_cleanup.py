@@ -2423,7 +2423,24 @@ def merge_accounts(plan: Plan, reports: dict, notes: list) -> None:
     plan.notes.extend(notes)
 
 
+def cloud_session(env: dict | None = None) -> str | None:
+    """Why this is a cloud session, or None. A cloud session (Claude Code on the web, a cloud routine) runs in a
+    remote container: it cannot see this computer's disk, and cleaning it would free nothing anyone keeps."""
+    env = os.environ if env is None else env
+    for name in ("CLAUDE_CODE_REMOTE", "CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE"):
+        value = env.get(name, "").strip()
+        if value and value.lower() not in ("0", "false", "no"):
+            return f"{name}={value}"
+    return None
+
+
 def cmd_run(args: argparse.Namespace, mode: str) -> int:
+    cloud = cloud_session()
+    if cloud:
+        log(f"refusing to run in a cloud session ({cloud}): it runs in a remote container that cannot see this "
+            "computer's disk. Run it on the computer itself: from the Claude desktop app's Code tab, a local "
+            "scheduled task, or Terminal")
+        return 4
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         log("refusing to run as root: git would leave root-owned files in the checkouts; run it as each account")
         return 2

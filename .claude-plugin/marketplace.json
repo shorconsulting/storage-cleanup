@@ -10,7 +10,7 @@
       "name": "storage-cleanup",
       "source": "./",
       "description": "Frees disk across every git checkout (merged worktrees and branches, idle build output, caches, stray and orphaned Claude worktrees) and what AI sessions leave elsewhere (temp folders, crash dumps, test databases), and tidies GitHub branches, Actions caches and artifacts; test mode reports only.",
-      "version": "0.2.0"
+      "version": "0.3.0"
     }
   ]
 }

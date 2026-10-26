@@ -1,14 +1,25 @@
 ---
 description: Free disk space across every local git checkout and tidy the GitHub remotes (test mode reports only)
-argument-hint: '[test | clean] [--home dgshor,aiuser1] [--local-only | --remote-only] [--no-caches] [--where]'
-allowed-tools: Bash(python3 *), Artifact
+argument-hint: '[test | clean | schedule] [--home dgshor,aiuser1] [--local-only | --remote-only] [--no-caches] [--where]'
+allowed-tools: Bash(python3 *), Artifact, mcp__scheduled-tasks__create_scheduled_task, mcp__scheduled-tasks__list_scheduled_tasks
 ---
 
 Free disk space on this computer and tidy the GitHub remotes, or (test mode) report how much would be freed, and
 show the result as the `Storage cleanup` artifact. Run unattended: never ask a question, never stop to confirm,
 never delete anything yourself. The script decides what is safe; your job is to run it, publish its page, and report.
 
+This plugin works on this computer's disk, so it always runs locally, never in a cloud environment. If this session
+is a cloud session (Claude Code on the web, a cloud routine, a remote container), the script refuses with exit code 4:
+reply in one line that the cleanup has to run on the Mac itself, from the Claude desktop app's Code tab or a local
+scheduled task, publish nothing, and stop.
+
 ## Steps
+
+0. Schedule (the arguments ask to schedule it, or `schedule`): create a **local** scheduled task on this computer
+   with the `create_scheduled_task` tool (scheduled-tasks) - never a cloud routine (`/schedule`, `RemoteTrigger`), which
+   runs in a remote container that cannot see this disk. Schedule: daily at a quiet hour (`17 3 * * *` unless the
+   arguments give one); prompt: `/storage-cleanup clean` (or `/storage-cleanup test` when the arguments say test).
+   Reply with the task's name and next run time, and stop.
 
 1. Pick the mode from the arguments: `clean` frees the space; anything else (no arguments, `test`, `scan`,
    `clean --dry-run`) is a test run that deletes and moves nothing (it only refreshes remote-tracking refs with `git fetch --prune` and writes its own report files). Pass the remaining flags through, and always add
@@ -19,7 +30,8 @@ never delete anything yourself. The script decides what is safe; your job is to 
 
    Every run below can take several minutes (it sizes folders and fetches each checkout): give each command a
    timeout of at least 30 minutes. Exit code 1 means some actions failed (listed under `Failed:`); 2 means it was
-   started as root (refused); 3 means another run holds the lock.
+   started as root (refused); 3 means another run holds the lock; 4 means this is a cloud session (refused, see
+   above).
 
 2. Find the artifact: call the Artifact tool with `action: "list"` and look for one titled `Storage cleanup`. If one
    exists, read it once (`action: "read"`) and publish to its `url` in every step below, so the link stays the same

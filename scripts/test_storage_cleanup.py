@@ -1149,6 +1149,27 @@ class Helpers(unittest.TestCase):
         self.assertEqual(sc.human(512), "512 B")
         self.assertEqual(sc.human(3 * sc.GB), "3.0 GB")
 
+    def test_cloud_sessions_are_recognised(self):
+        self.assertIsNone(sc.cloud_session({}))
+        self.assertIsNone(sc.cloud_session({"CLAUDE_CODE_REMOTE": "false", "CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE": ""}))
+        self.assertIn("CLAUDE_CODE_REMOTE", sc.cloud_session({"CLAUDE_CODE_REMOTE": "true"}))
+        self.assertIn("ENVIRONMENT_TYPE", sc.cloud_session({"CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE": "cloud"}))
+
+    def test_a_run_in_a_cloud_session_is_refused_before_anything_happens(self):
+        runs = sc.HOME / "runs.jsonl"
+        before = runs.read_text() if runs.exists() else None
+        saved = os.environ.get("CLAUDE_CODE_REMOTE")
+        os.environ["CLAUDE_CODE_REMOTE"] = "true"
+        try:
+            self.assertEqual(sc.main(["clean", "--quiet"]), 4)
+            self.assertEqual(sc.main(["test", "--quiet", "--remote-only"]), 4)
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_CODE_REMOTE")
+            else:
+                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        self.assertEqual(runs.read_text() if runs.exists() else None, before)  # no run was recorded
+
     def test_homes_skip_accounts_that_do_not_exist(self):
         c = sc.load_config()
         c["homes"] = ["~", "~no-such-account-xyz"]

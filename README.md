@@ -38,6 +38,7 @@ Then `python3 ~/storage_cleanup.py clean --all-accounts` from an administrator a
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `/storage-cleanup` or `/storage-cleanup test` | Test run: shows what would be removed and how much space it frees. Deletes nothing (see below) |
 | `/storage-cleanup clean`                      | Shows the plan at once ("Cleaning now"), frees the space, then updates the page                |
+| `/storage-cleanup schedule`                   | Creates a daily local scheduled task on this Mac (never a cloud routine)                       |
 | `... --home dgshor,aiuser1`                   | Only these accounts' home folders                                                              |
 | `... --local-only` / `--remote-only`          | Only the disk / only GitHub                                                                    |
 | `... --no-caches`                             | Leave npm, pip, Playwright, Homebrew and docker caches alone                                   |
@@ -184,9 +185,11 @@ python3 storage_cleanup.py clean --all-accounts
 
 ## Schedule it
 
-The routine has to run **on the Mac whose disk it cleans**. A cloud routine runs in a remote container and cannot
-see this disk. From the Claude desktop app on that Mac, signed in as each account, create a routine or scheduled task
-that runs on this computer:
+The routine has to run **on the Mac whose disk it cleans**, so the plugin always defaults to the local environment.
+A cloud routine or a Claude Code on the web session runs in a remote container and cannot see this disk: there the
+script refuses to run (exit code 4) and the command says to run it on the Mac instead. From the Claude desktop app
+on that Mac, signed in as each account, run `/storage-cleanup schedule` (it creates a local scheduled task, never a
+cloud routine), or create a scheduled task that runs on this computer yourself:
 
 - Schedule: daily at a quiet hour, for example `CRON_TZ=America/Toronto 17 3 * * *`.
 - Prompt: `/storage-cleanup clean`, or `/storage-cleanup test` for a week to watch what it would do first.
@@ -222,4 +225,4 @@ scripts/storage_cleanup.py        the cleaner (stdlib only)
 scripts/test_storage_cleanup.py   tests on throwaway git repositories and a fake GitHub
 ```
 
-Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'` (54 cases).
+Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'` (69 cases).

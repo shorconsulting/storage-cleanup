@@ -1,8 +1,8 @@
 {
   "name": "storage-cleanup",
   "displayName": "Storage Cleanup",
-  "version": "0.2.0",
-  "description": "Frees local disk across every git checkout in the dgshor, aiuser1 and aiuser2 home folders (merged worktrees and branches, build output of idle checkouts, oversized caches, stray Claude worktrees gathered into their checkout) and what AI sessions leave elsewhere (orphaned worktree folders, idle Claude session temp folders, old crash dumps, idle throwaway test databases), and tidies GitHub (branches of closed PRs, stale Actions caches and artifacts). Has a test mode that reports what it would free.",
+  "version": "0.3.0",
+  "description": "Frees local disk across every git checkout in the dgshor, aiuser1 and aiuser2 home folders (merged worktrees and branches, build output of idle checkouts, oversized caches, stray Claude worktrees gathered into their checkout) and what AI sessions leave elsewhere (orphaned worktree folders, idle Claude session temp folders, old crash dumps, idle throwaway test databases), and tidies GitHub (branches of closed PRs, stale Actions caches and artifacts). Always runs locally: it refuses a cloud session and schedules itself as a local task. Has a test mode that reports what it would free.",
   "author": {
     "name": "David Shor",
     "url": "https://github.com/shorconsulting"

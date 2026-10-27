@@ -139,10 +139,27 @@ lives.
   `sudo tmutil deletelocalsnapshots /` is run in Terminal (it needs the password; backups on a Time Machine drive
   stay).
 
-Remote cleanup runs only for repositories owned by `homeporthealth`, `Velocity-Org`, `Shor-Consulting-Inc` and
-`shorconsulting`, where the `gh` login has push access; other remotes (for example the legacy repositories) get
-local cleanup only. Before judging a checkout it runs `git fetch --prune`, so a branch deleted on GitHub is never
-mistaken for pushed work.
+Remote cleanup runs only for repositories owned by `homeporthealth`, `Velocity-Org`, `Shor-Consulting-Inc`,
+`ShorConsultingInc`, `shorconsulting` and `VAIVentures`, where the `gh` login has push access; other remotes (for
+example the legacy repositories) get local cleanup only. Before judging a checkout it runs `git fetch --prune`, so a
+branch deleted on GitHub is never mistaken for pushed work.
+
+## Moved and broken repositories
+
+- **Moved repositories.** When a repository is transferred or renamed, GitHub redirects its old name for a while,
+  and checkouts keep pointing there. The run cleans such a repository once, under its current name (its pull
+  requests name their head repository that way, so under the old name each one would look like a fork's and no
+  branch would ever count as merged). It lists each checkout under **Moved repositories** with the command that
+  points `origin` at the new place, for example
+  `git -C ~/work/ranch-rides remote set-url origin https://github.com/ShorConsultingInc/ranch-rides.git`. When
+  GitHub no longer finds a repository at all, the same name is looked up under the other `remoteOwners`, and a
+  match is checked for the clone's commits before it is offered. The run never changes a remote itself: the
+  checkout's owner runs the command, and the next run cleans the checkout normally. A new owner missing from
+  `remoteOwners` is pointed out, since after the switch only those owners are fetched. A repository found nowhere
+  is listed under **Gone from GitHub** and nothing in its clone is deleted: it may hold the only copy of its work.
+- **Broken checkouts.** A `.git` folder git cannot open (no `HEAD`, typically a clone an agent deleted half of, or
+  one interrupted) is listed under **Broken checkouts** with its size, never touched, and is not counted as a failed
+  action. Its objects may still hold work: check it and delete it by hand.
 
 ## Several accounts
 
@@ -179,8 +196,10 @@ python3 storage_cleanup.py clean --all-accounts
 - Just before deleting a remote branch, the open pull requests are read again, and a branch an open PR has started
   to use since the plan was made is kept.
 - With no terminal to type the password in (a run from a Claude session or a scheduled routine), sudo cannot ask,
-  so those accounts are reported as `could not run as <account> through sudo` and left for the next run from
-  Terminal, or for that account's own run. Letting it run unattended would take a password-free sudo rule for this
+  so those accounts are reported as `could not run as <accounts> through sudo`, with the command that covers them:
+  `python3 /Users/Shared/storage-cleanup-<uid>/storage_cleanup.py clean --all-accounts`. Run it in Terminal from
+  any account that may use sudo; it is the shared copy, because an account signed in to Terminal cannot read the
+  plugin folder in another account's home. Letting it run unattended would take a password-free sudo rule for this
   command, a change to the Mac's security settings the script never makes itself.
 
 ## Schedule it
@@ -213,8 +232,11 @@ with every default; `config show` prints the effective one). Keys: `homes`, `roo
 `artifacts`, `artifactDays`).
 
 Each run writes `~/.claude/storage-cleanup/out/<time>-<scan|clean>.json` (the last 60 are kept) and the HTML page
-`out/storage-cleanup.html` (`--html PATH` writes a copy elsewhere), and appends one line to `runs.jsonl` (free space
-before and after), which feeds the page's recent runs. A lock file stops two runs from overlapping.
+`out/storage-cleanup.html`, plus a copy every account can read at
+`/Users/Shared/storage-cleanup-<uid>/storage-cleanup.html`, so a Claude session in any account can publish the page
+of a run made from Terminal (`--html PATH` writes one more copy elsewhere). It appends one line to `runs.jsonl`
+(free space before and after), which feeds the page's recent runs. A lock file stops two runs from overlapping.
+Notes are listed once, however many checkouts of a repository report the same thing.
 
 ## Files
 
@@ -225,4 +247,4 @@ scripts/storage_cleanup.py        the cleaner (stdlib only)
 scripts/test_storage_cleanup.py   tests on throwaway git repositories and a fake GitHub
 ```
 
-Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'` (69 cases).
+Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'` (83 cases).

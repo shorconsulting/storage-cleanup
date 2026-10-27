@@ -1,14 +1,25 @@
 ---
 description: Free disk space across every local git checkout and tidy the GitHub remotes (test mode reports only)
-argument-hint: '[test | clean] [--home dgshor,aiuser1] [--local-only | --remote-only] [--no-caches] [--where]'
-allowed-tools: Bash(python3 *), Artifact
+argument-hint: '[test | clean | schedule] [--home dgshor,aiuser1] [--local-only | --remote-only] [--no-caches] [--where]'
+allowed-tools: Bash(python3 *), Bash(ls *), Bash(cp *), Read, Artifact, mcp__scheduled-tasks__create_scheduled_task, mcp__scheduled-tasks__list_scheduled_tasks
 ---
 
 Free disk space on this computer and tidy the GitHub remotes, or (test mode) report how much would be freed, and
 show the result as the `Storage cleanup` artifact. Run unattended: never ask a question, never stop to confirm,
 never delete anything yourself. The script decides what is safe; your job is to run it, publish its page, and report.
 
+This plugin works on this computer's disk, so it always runs locally, never in a cloud environment. If this session
+is a cloud session (Claude Code on the web, a cloud routine, a remote container), the script refuses with exit code 4:
+reply in one line that the cleanup has to run on the Mac itself, from the Claude desktop app's Code tab or a local
+scheduled task, publish nothing, and stop.
+
 ## Steps
+
+0. Schedule (the arguments ask to schedule it, or `schedule`): create a **local** scheduled task on this computer
+   with the `create_scheduled_task` tool (scheduled-tasks) - never a cloud routine (`/schedule`, `RemoteTrigger`), which
+   runs in a remote container that cannot see this disk. Schedule: daily at a quiet hour (`17 3 * * *` unless the
+   arguments give one); prompt: `/storage-cleanup clean` (or `/storage-cleanup test` when the arguments say test).
+   Reply with the task's name and next run time, and stop.
 
 1. Pick the mode from the arguments: `clean` frees the space; anything else (no arguments, `test`, `scan`,
    `clean --dry-run`) is a test run that deletes and moves nothing (it only refreshes remote-tracking refs with `git fetch --prune` and writes its own report files). Pass the remaining flags through, and always add
@@ -19,7 +30,8 @@ never delete anything yourself. The script decides what is safe; your job is to 
 
    Every run below can take several minutes (it sizes folders and fetches each checkout): give each command a
    timeout of at least 30 minutes. Exit code 1 means some actions failed (listed under `Failed:`); 2 means it was
-   started as root (refused); 3 means another run holds the lock.
+   started as root (refused); 3 means another run holds the lock; 4 means this is a cloud session (refused, see
+   above).
 
 2. Find the artifact: call the Artifact tool with `action: "list"` and look for one titled `Storage cleanup`. If one
    exists, read it once (`action: "read"`) and publish to its `url` in every step below, so the link stays the same
@@ -42,14 +54,21 @@ never delete anything yourself. The script decides what is safe; your job is to 
       not stay on "Cleaning now": run the preview again without `--pending` and publish that.
 
 5. Reply with the summary the last run printed (the free-space line, the table, the largest items, the remote
-   lines, the `Needs another account` lines and the `Kept` lines) and the artifact link. Then add at most three
-   lines:
+   lines, the `Moved repositories`, `Gone from GitHub` and `Broken checkouts` lines, the `Needs another account`
+   lines and the `Kept` lines) and the artifact link. Never run a `Moved repositories` command yourself: changing a
+   checkout's remote is the user's call. Then add at most three lines:
    - in a test run, the single command that would free the space (`/storage-cleanup clean`, with the same flags);
-   - when a `Note:` says `could not run as <account> through sudo`: sudo needs a password and this session has no
-     terminal to type it in. Say once that the other accounts were not cleaned, and that running
-     `python3 <plugin>/scripts/storage_cleanup.py clean --all-accounts` in Terminal (it asks for the password once)
-     covers them. Never edit sudoers or sudo settings yourself;
+   - when a `Note:` says `could not run as <accounts> through sudo`: sudo needs a password and this session has no
+     terminal to type it in. Say once that those accounts were not cleaned, and give the command the note quotes
+     (`python3 /Users/Shared/storage-cleanup-<uid>/storage_cleanup.py clean --all-accounts`): it is a copy every
+     account can read, so it works from whichever account the user's Terminal is signed in to, while the plugin's
+     own folder does not. Never edit sudoers or sudo settings yourself;
    - any `Failed:` item, `Note:` about gh not being logged in, or exit code other than 0, in one line each.
+
+6. Republish after a run in Terminal (the user ran the command themselves and asks for the page): every run also
+   writes its page to `/Users/Shared/storage-cleanup-<uid of the account that ran it>/storage-cleanup.html`, which
+   every account can read. Use the newest of those (`ls -t /Users/Shared/storage-cleanup-*/storage-cleanup.html`),
+   read it in full, copy it over `PAGE` and publish `PAGE` to the same artifact; reply with the summary from it.
 
 ## What it does (for answering questions about a run)
 
@@ -82,6 +101,12 @@ never delete anything yourself. The script decides what is safe; your job is to 
 - **Remote** (owners in `remoteOwners`, push access via `gh`): branches whose PR merged at least 1 day ago or closed
   unmerged at least 30 days ago, untouched since; never a branch an open PR uses as head or base, never protected
   branches, never a branch with no PR. Actions caches of closed PRs and deleted branches; artifacts older than
-  14 days.
+  14 days. A repository GitHub redirects (transferred or renamed) is cleaned once, under its current name.
+- **Moved repositories**, reported, never changed: a checkout whose `origin` GitHub redirects to a new owner or
+  name, or no longer finds (then the same name is looked up under the other `remoteOwners`, and checked for the
+  clone's commits). Each comes with the `git remote set-url` command to run as the checkout's owner. One found
+  nowhere is listed under `Gone from GitHub`: the clone may hold the only copy of its work.
+- **Broken checkouts**, reported, never touched: a `.git` folder git cannot open (no `HEAD`, a half-deleted or
+  interrupted clone). They are not failures.
 - Thresholds, homes and owners live in `~/.claude/storage-cleanup/config.json`
   (`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/storage_cleanup.py" config init` writes it with every default).

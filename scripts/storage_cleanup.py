@@ -29,6 +29,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -105,7 +106,10 @@ DEFAULTS: dict = {
     "playwrightKeep": 2,
     "dockerBuilderUntilHours": 168,
     # Remote cleanup runs only for repositories under these owners, with push access through gh.
-    "remoteOwners": ["homeporthealth", "Velocity-Org", "Shor-Consulting-Inc", "shorconsulting"],
+    # A checkout whose repository GitHub no longer serves under its owner is looked up under the other owners here,
+    # and reported with the command that points it at the new place.
+    "remoteOwners": ["homeporthealth", "Velocity-Org", "Shor-Consulting-Inc", "ShorConsultingInc", "shorconsulting",
+                     "VAIVentures"],
     "remote": {"branches": True, "mergedGraceDays": 1, "closedGraceDays": 30, "actionsCaches": True,
                "artifacts": True, "artifactDays": 14},
 }
@@ -471,6 +475,7 @@ class Repo:
         self.slug = parse_slug(self.remote_url) if self.remote_url else None
         self.fetched = False
         self.fetch_error = ""
+        self.moved = None  # the Moved repositories entry when GitHub no longer serves origin where it points
         self.default_branch = None
         self.worktrees = []
 
@@ -531,6 +536,82 @@ def protected(name: str, cfg: dict, default: str | None) -> bool:
     return name == default or any(fnmatch.fnmatch(name, p) for p in cfg.get("protectBranches", []))
 
 
+def broken_checkout(path: Path) -> str | None:
+    """Why git cannot open this checkout's `.git` folder (a half-deleted or interrupted clone), or None. Only for a
+    `.git` the running account owns: git refuses another account's (safe.directory), and that is not broken."""
+    dotgit = path / ".git"
+    if owner_of(dotgit) != current_user() or not os.access(str(dotgit), os.R_OK | os.X_OK):
+        return None
+    rc, out, err = git(path, "rev-parse", "--absolute-git-dir")
+    # A `.git` git does not recognise makes it look further up: an answer for another folder means broken too.
+    if rc == 0 and os.path.realpath(out.strip()) == os.path.realpath(str(dotgit)):
+        return None
+    missing = [n for n in ("HEAD", "objects", "refs") if not exists(dotgit / n)]
+    if missing:
+        return "no " + ", ".join(missing) + " in .git"
+    return (err.strip().splitlines() or ["git cannot open it"])[-1]
+
+
+def not_found(e: Exception) -> bool:
+    return "404" in str(e) or "Not Found" in str(e)
+
+
+def new_home(slug: str, cfg: dict, gh, plan: Plan) -> str:
+    """Where a repository GitHub no longer serves under `slug` lives now: the same name under another owner in
+    remoteOwners that this account's gh login can read ("" when there is none). One lookup per repository."""
+    key = slug.lower()
+    if key not in plan.new_homes:
+        owner, name = slug.split("/", 1)
+        found = ""
+        for other in cfg["remoteOwners"]:
+            if other.lower() == owner.lower():
+                continue
+            try:
+                found = gh.info(f"{other}/{name}").get("full_name") or f"{other}/{name}"
+                break
+            except RuntimeError:
+                continue
+        plan.new_homes[key] = found
+    return plan.new_homes[key]
+
+
+def with_slug(url: str, slug: str) -> str:
+    """The remote URL with its owner/name replaced, keeping its form (https or ssh, .git or not)."""
+    m = SLUG_RE.search(url.strip())
+    return url.strip()[:m.start(1)] + slug + url.strip()[m.end(2):] if m else url
+
+
+def plan_moved(repo: Repo, cfg: dict, gh, plan: Plan) -> None:
+    """Report a checkout whose origin GitHub no longer serves where it points: gone (not found for this gh login),
+    or moved (GitHub redirects it to a new owner or name). Nothing is changed: the entry carries the command that
+    points origin at the new place, which the checkout's owner runs; the next run then cleans it normally."""
+    gone = False
+    try:
+        info = gh.info(repo.slug)
+    except RuntimeError as e:
+        if not not_found(e):
+            return
+        gone, info = True, {}
+    new = new_home(repo.slug, cfg, gh, plan) if gone else (info.get("full_name") or "")
+    if not gone and (not new or new.lower() == repo.slug.lower()):
+        return
+    same = False
+    if new and gone:  # the same name elsewhere is a guess until it holds this clone's commits
+        ref = repo.default_ref or "HEAD"
+        rc, out, _ = git(repo.path, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        same = rc == 0 and gh.has_commit(new, out.strip())
+    elif new:
+        same = True  # GitHub's own redirect: the same repository under its new name
+    url = with_slug(repo.remote_url, new) if new else ""
+    # After the switch only owners in remoteOwners are fetched and cleaned on GitHub.
+    unlisted = bool(new) and new.split("/")[0].lower() not in {o.lower() for o in cfg["remoteOwners"]}
+    repo.moved = {"path": str(repo.path), "account": repo.owner, "old": repo.slug, "new": new, "gone": gone,
+                  "same": same, "unlisted": unlisted,
+                  "command": f"git -C {shlex.quote(str(repo.path))} remote set-url origin {shlex.quote(url)}"
+                             if new else ""}
+    plan.moved.append(repo.moved)
+
+
 # ----------------------------------------------------------------------------- GitHub
 
 class GitHub:
@@ -553,7 +634,7 @@ class GitHub:
 
     def info(self, slug: str) -> dict:
         return self._memo("info:" + slug, lambda: self._lines(
-            f"repos/{slug}", "{default_branch, push: .permissions.push, archived} | tojson")[0])
+            f"repos/{slug}", "{full_name, default_branch, push: .permissions.push, archived} | tojson")[0])
 
     def pulls(self, slug: str) -> list:
         jq = (".[] | {number, state, merged_at, closed_at, head_ref: .head.ref, head_sha: .head.sha, "
@@ -580,6 +661,10 @@ class GitHub:
             found += self._lines(f"repos/{slug}/pulls?state=open&per_page=5&{param}", ".[] | {number} | tojson")
         return [p["number"] for p in found]
 
+    def has_commit(self, slug: str, sha: str) -> bool:
+        rc, out, _ = run(["gh", "api", f"repos/{slug}/commits/{sha}", "--jq", ".sha"], timeout=120)
+        return rc == 0 and out.strip() == sha
+
     def delete(self, path: str) -> tuple:
         rc, _, err = run(["gh", "api", "-X", "DELETE", path], timeout=120)
         return rc == 0, err.strip()
@@ -596,6 +681,10 @@ class Plan:
         self.remote: list = []    # per-repository remote summary
         self.loose: list = []     # worktree folders git no longer knows (report only): path, bytes, modified
         self.slugs: list = []     # GitHub repositories of the checkouts found
+        self.broken: list = []    # `.git` folders git cannot open (report only): path, bytes, modified, why
+        self.moved: list = []     # checkouts whose origin GitHub no longer serves (report only), with the fix
+        self.new_homes: dict = {}  # repository -> where it lives now ("" when nowhere this account can see)
+        self.remote_done: set = set()  # repositories (GitHub's own name) the remote pass has planned already
 
     def add(self, kind: str, target: str, size: int, why: str, fn, home: str = "") -> None:
         self.actions.append({"kind": kind, "target": target, "bytes": int(size), "why": why, "home": home,
@@ -617,10 +706,14 @@ def plan_repo(repo: Repo, cfg: dict, gh: GitHub | None, plan: Plan, cwds: set, n
         repo.fetched = rc == 0
         repo.fetch_error = "" if rc == 0 else (err.strip().splitlines() or ["fetch failed"])[-1]
     repo.load()
+    if gh and gh.ok and allowed and repo.writable:
+        plan_moved(repo, cfg, gh, plan)
     prs = []
-    if gh and gh.ok and allowed:
+    if gh and gh.ok and allowed and not (repo.moved and repo.moved["gone"]):
+        # A redirected repository's pull requests name their head repository by its new name.
+        names = {repo.slug.lower(), (repo.moved["new"] if repo.moved else repo.slug).lower()}
         try:
-            prs = [p for p in gh.pulls(repo.slug) if p.get("head_repo") in (None, repo.slug)]
+            prs = [p for p in gh.pulls(repo.slug) if p.get("head_repo") is None or p["head_repo"].lower() in names]
         except RuntimeError as e:
             plan.notes.append(f"{repo.slug}: pull requests unreadable ({e}); merged-PR detection off")
 
@@ -1774,8 +1867,18 @@ def plan_remote(slug: str, cfg: dict, gh: GitHub, plan: Plan, now: dt.datetime) 
     try:
         info = gh.info(slug)
     except RuntimeError as e:
-        summary["skipped"] = f"unreadable ({e})"
+        new = new_home(slug, cfg, gh, plan) if not_found(e) else ""
+        summary["skipped"] = (f"not found here; now at {new} (see Moved repositories)" if new
+                              else f"unreadable ({e})")
         return
+    canonical = info.get("full_name") or slug
+    if canonical.lower() in plan.remote_done:
+        summary["skipped"] = f"same repository as {canonical} (GitHub redirects), cleaned once"
+        return
+    plan.remote_done.add(canonical.lower())
+    # GitHub's current name from here on: pull requests name their head repository that way (under the old name
+    # every one would look like a fork's), the fresh open-PR check filters on its owner, and deletes go straight to it.
+    slug = summary["repo"] = canonical
     if info.get("archived"):
         summary["skipped"] = "archived"
         return
@@ -1910,9 +2013,18 @@ def build_plan(args: argparse.Namespace, cfg: dict, gh: GitHub | None, extra_slu
 
     def add_repo(p: Path, home: str) -> None:
         key = os.path.realpath(str(p))
-        if key not in seen_repos:
-            seen_repos.add(key)
-            repos.append((Repo(p), home or owner_of(p)))
+        if key in seen_repos:
+            return
+        seen_repos.add(key)
+        why = broken_checkout(p)
+        if why:  # nothing git could do there would work: reported for a person to look at, never touched
+            try:
+                modified = dt.datetime.fromtimestamp(os.lstat(str(p / ".git")).st_mtime).strftime("%Y-%m-%d")
+            except OSError:
+                modified = ""
+            plan.broken.append({"path": str(p), "bytes": du_bytes(p), "modified": modified, "why": why})
+            return
+        repos.append((Repo(p), home or owner_of(p)))
 
     roots = [(h["name"], h["path"]) for h in homes]
     roots += [("", Path(os.path.expanduser(r))) for r in cfg.get("roots", [])]
@@ -1973,7 +2085,7 @@ def build_plan(args: argparse.Namespace, cfg: dict, gh: GitHub | None, extra_slu
                 del plan.actions[planned:]
                 plan.keep("checkout", str(r.path), f"skipped after an error: {type(e).__name__}: {e}")
                 continue
-            if r.fetch_error:
+            if r.fetch_error and not (r.moved and r.moved["gone"]):  # a gone repository is listed as moved
                 plan.notes.append(f"{r.path}: fetch failed ({r.fetch_error}); pushed-only worktrees kept")
         for i, (w, g) in enumerate(orphans, 1):
             step(f"orphaned worktree folder [{i}/{len(orphans)}] {w}")
@@ -2053,6 +2165,28 @@ def summarize(plan: Plan, mode: str, homes: list, repos: list, before: tuple, af
         lines.append("Orphaned worktree folders git no longer knows (their build output goes once idle; the folders "
                      "stay: check them and delete by hand):")
         lines += [f"- {human(x['bytes'])}  {x['path']}  (changed {x['modified']})" for x in plan.loose[:20]]
+        lines.append("")
+    moved = [m for m in plan.moved if m["new"]]
+    if moved:
+        lines.append("Moved repositories (origin points at the repository's old place; run the command as the "
+                     "checkout's owner, and the next run cleans the checkout normally):")
+        lines += [f"- {m['path']}: {m['old']} -> {m['new']} ("
+                  + ("GitHub redirects there for now" if not m["gone"] else "not found at the old place; " + (
+                      "its commits are there" if m["same"] else "same name, but its commits were not found there: "
+                                                                 "compare before switching"))
+                  + (f"; add {m['new'].split('/')[0]} to remoteOwners first" if m.get("unlisted") else "")
+                  + f"): `{m['command']}`" for m in moved]
+        lines.append("")
+    gone = [m for m in plan.moved if not m["new"]]
+    if gone:
+        lines.append("Gone from GitHub (not found under any owner in remoteOwners with this gh login; the clone may "
+                     "hold the only copy of its work, and nothing in it is deleted):")
+        lines += [f"- {m['path']}: {m['old']}" for m in gone]
+        lines.append("")
+    if plan.broken:
+        lines.append("Broken checkouts (git cannot open their .git, for example a half-deleted clone; never touched: "
+                     "check them and delete by hand):")
+        lines += [f"- {human(x['bytes'])}  {x['path']}  ({x['why']}, changed {x['modified']})" for x in plan.broken[:20]]
         lines.append("")
     failed = [a for a in plan.actions if a["status"] == "failed"]
     if failed:
@@ -2269,6 +2403,35 @@ def render_html(report: dict, runs: list | None = None) -> str:
                      f"<td>{_e(x['modified'])}</td></tr>")
         p.append("</tbody></table></div></section>")
 
+    if report.get("moved"):
+        p.append("<section class=\"callout\"><h2>Moved repositories</h2><p class=\"meta\">These checkouts' "
+                 "<code>origin</code> points at the repository's old place. Where GitHub still redirects, they work "
+                 "for now; where it does not, they cannot be fetched or checked for merged work, and everything in "
+                 "them is kept. Run the command as the checkout's owner; the next run then cleans it normally. A "
+                 "repository found nowhere is only listed: the clone may hold the only copy of its work.</p><div class=\"scroll\"><table><thead><tr><th>Checkout</th>"
+                 "<th>Was</th><th>Now</th><th>Command</th></tr></thead><tbody>")
+        for m in report["moved"]:
+            how = ("GitHub redirects" if not m["gone"] else "its commits are there" if m["same"]
+                   else "same name; its commits were not found there, compare first")
+            if m.get("unlisted"):
+                how += f"; add {m['new'].split('/')[0]} to remoteOwners first"
+            now = (f"{_e(m['new'])} <span class=\"why\">({_e(how)})</span>" if m["new"]
+                   else "<span class=\"why\">not found</span>")
+            p.append(f"<tr><td class=\"path\">{_e(m['path'])}</td><td><code>{_e(m['old'])}</code></td><td>{now}</td>"
+                     f"<td class=\"path\">{_e(m['command']) or '-'}</td></tr>")
+        p.append("</tbody></table></div></section>")
+
+    if report.get("broken"):
+        p.append("<section class=\"callout\"><h2>Broken checkouts</h2><p class=\"meta\">Git cannot open these "
+                 "folders' <code>.git</code> (a half-deleted or interrupted clone, for example), so nothing is done "
+                 "in them. Their objects may still hold work: check each one and delete it by hand when it is done."
+                 "</p><div class=\"scroll\"><table><thead><tr><th class=\"n\">Size</th><th>Folder</th><th>Why</th>"
+                 "<th>Changed</th></tr></thead><tbody>")
+        for x in report["broken"]:
+            p.append(f"<tr><td class=\"n\">{human(x['bytes'])}</td><td class=\"path\">{_e(x['path'])}</td>"
+                     f"<td class=\"why\">{_e(x['why'])}</td><td>{_e(x['modified'])}</td></tr>")
+        p.append("</tbody></table></div></section>")
+
     if report.get("remote"):
         p.append("<section><h2>GitHub</h2><div class=\"scroll\"><table><thead><tr><th>Repository</th>"
                  "<th class=\"n\">Branches</th><th class=\"n\">Actions caches</th><th class=\"n\">Artifacts</th>"
@@ -2368,6 +2531,7 @@ def run_accounts(args: argparse.Namespace, mode: str, accounts: list) -> tuple:
     # keeps squash-merged work it cannot prove merged). The other accounts are agent accounts with their own hooks
     # and credential helpers, and this token can delete branches.
     env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    missed = []
     for acct in accounts:
         if sys.stdin.isatty():
             # sudo's password lasts about 5 minutes (macOS timestamp_timeout) and one account's part takes longer:
@@ -2382,17 +2546,23 @@ def run_accounts(args: argparse.Namespace, mode: str, accounts: list) -> tuple:
         except (ValueError, subprocess.TimeoutExpired, OSError):
             report = None
         if report is None:
-            notes.append(f"could not run as {acct} through sudo (no password given, or this account may not use "
-                         f"sudo); run it signed in as {acct} (README: All accounts from one place)")
+            missed.append(acct)
         else:
             reports[acct] = report
+    if missed:
+        # The shared copy, not this file: another account signed in to Terminal cannot read this account's home.
+        verb = "clean" if mode == "clean" else "test"
+        notes.append(f"could not run as {', '.join(missed)} through sudo (no password given, or this account may not "
+                     f"use sudo); `python3 {shlex.quote(script)} {verb} --all-accounts` in Terminal, from any account "
+                     f"that may use sudo, covers them (it asks for the password once, and writes the page to "
+                     f"{Path(script).parent.parent}/storage-cleanup-<uid of that account>/storage-cleanup.html)")
     return reports, notes
 
 
-def shared_script() -> Path:
-    """A copy of this script the other accounts can read: they cannot read this account's home. One folder per
-    account (any account may start --all-accounts), which must be a real folder this account owns: one another
-    account created, or a symlink, is refused (RuntimeError, reported as a note) rather than written to."""
+def shared_dir() -> Path:
+    """This account's folder every account can read: they cannot read this account's home. One folder per account
+    (any account may start --all-accounts), which must be a real folder this account owns: one another account
+    created, or a symlink, is refused (RuntimeError, reported as a note) rather than written to."""
     base = Path("/Users/Shared") if sys.platform == "darwin" else Path("/tmp")
     d = base / f"storage-cleanup-{os.getuid()}"
     d.mkdir(parents=True, exist_ok=True)
@@ -2400,6 +2570,12 @@ def shared_script() -> Path:
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise RuntimeError(f"{d} is not a folder owned by {current_user()}; remove it and run again")
     os.chmod(str(d), 0o755)
+    return d
+
+
+def shared_script() -> Path:
+    """A copy of this script the other accounts can read, in shared_dir()."""
+    d = shared_dir()
     dest = d / "storage_cleanup.py"
     tmp = d / f".storage_cleanup.{os.getpid()}.py"
     tmp.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
@@ -2414,6 +2590,8 @@ def merge_accounts(plan: Plan, reports: dict, notes: list) -> None:
         plan.actions.extend(rep.get("actions", []))
         plan.kept.extend(rep.get("kept", []))
         plan.loose.extend(rep.get("loose", []))
+        plan.broken.extend(rep.get("broken", []))
+        plan.moved.extend(rep.get("moved", []))
         plan.notes.extend(f"{acct}: {n}" for n in rep.get("notes", []))
         for who, items in rep.get("needs", {}).items():
             plan.needs.setdefault(who, []).extend(items)
@@ -2423,7 +2601,24 @@ def merge_accounts(plan: Plan, reports: dict, notes: list) -> None:
     plan.notes.extend(notes)
 
 
+def cloud_session(env: dict | None = None) -> str | None:
+    """Why this is a cloud session, or None. A cloud session (Claude Code on the web, a cloud routine) runs in a
+    remote container: it cannot see this computer's disk, and cleaning it would free nothing anyone keeps."""
+    env = os.environ if env is None else env
+    for name in ("CLAUDE_CODE_REMOTE", "CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE"):
+        value = env.get(name, "").strip()
+        if value and value.lower() not in ("0", "false", "no"):
+            return f"{name}={value}"
+    return None
+
+
 def cmd_run(args: argparse.Namespace, mode: str) -> int:
+    cloud = cloud_session()
+    if cloud:
+        log(f"refusing to run in a cloud session ({cloud}): it runs in a remote container that cannot see this "
+            "computer's disk. Run it on the computer itself: from the Claude desktop app's Code tab, a local "
+            "scheduled task, or Terminal")
+        return 4
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         log("refusing to run as root: git would leave root-owned files in the checkouts; run it as each account")
         return 2
@@ -2472,6 +2667,7 @@ def cmd_run(args: argparse.Namespace, mode: str) -> int:
     args.where_rows = [(h["name"], where(h["path"])) for h in homes] if args.where else None
     if args.where_rows is not None:
         args.where_rows += [(a, [tuple(r) for r in rep.get("where", [])]) for a, rep in others.items()]
+    plan.notes = list(dict.fromkeys(plan.notes))  # several checkouts of one repository report the same thing
     homes = homes + [{"name": a, "path": Path("/")} for a in others]
     repos = repos + [None] * sum(int(rep.get("checkouts", 0)) for rep in others.values())
     text = summarize(plan, mode, homes, repos, before, after, args)
@@ -2485,7 +2681,7 @@ def cmd_run(args: argparse.Namespace, mode: str) -> int:
               "freeBefore": before[0], "freeAfter": after[0], "total": before[1], "reportPath": str(path),
               "actions": [{k: v for k, v in a.items() if k != "_run"} for a in plan.actions],
               "kept": plan.kept, "needs": plan.needs, "notes": plan.notes, "remote": plan.remote,
-              "loose": plan.loose, "slugs": plan.slugs,
+              "loose": plan.loose, "broken": plan.broken, "moved": plan.moved, "slugs": plan.slugs,
               "where": [list(r) for _, rows in (args.where_rows or [])[:1] for r in rows]}
     path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if not report["pending"]:  # the preview before a clean is not a run of its own
@@ -2496,16 +2692,30 @@ def cmd_run(args: argparse.Namespace, mode: str) -> int:
     for old in sorted(out_dir.glob("*.json"))[:-60]:
         old.unlink()
     page = render_html(report, read_runs())
-    html_paths = [out_dir / "storage-cleanup.html"] + ([Path(args.html)] if getattr(args, "html", None) else [])
+    html_paths = [out_dir / "storage-cleanup.html"]
+    shared = None
+    if not args.json:  # not for an account's part of --all-accounts: the starting account writes the whole page
+        try:
+            # Where a Claude session of any account can read the latest page (and publish it), whoever ran it.
+            shared = shared_dir() / "storage-cleanup.html"
+            html_paths.append(shared)
+        except (OSError, RuntimeError) as e:
+            log(f"the page was not shared with the other accounts: {e}")
+    if getattr(args, "html", None):
+        html_paths.append(Path(args.html))
     for hp in html_paths:
         hp.parent.mkdir(parents=True, exist_ok=True)
         hp.write_text(page, encoding="utf-8")
+    if shared:
+        os.chmod(str(shared), 0o644)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         print(text)
         print(f"Report: {path}")
         print(f"HTML: {html_paths[-1]}")
+        if shared and shared != html_paths[-1]:
+            print(f"Shared page: {shared}")
     return 1 if any(a["status"] == "failed" for a in plan.actions) else 0
 
 
@@ -2530,7 +2740,8 @@ def main(argv: list | None = None) -> int:
                        help="also run as every other account in `homes` through `sudo -u` (each changes only its "
                             "own files, never as root); one summary and one page for all of them")
         p.add_argument("--html", help="also write the HTML report here (it is always written to "
-                                      "~/.claude/storage-cleanup/out/storage-cleanup.html)")
+                                      "~/.claude/storage-cleanup/out/storage-cleanup.html and, readable by every "
+                                      "account, /Users/Shared/storage-cleanup-<uid>/storage-cleanup.html)")
         if name != "clean":
             p.add_argument("--pending", action="store_true",
                            help="the preview shown while a clean runs: the page says it is cleaning now")

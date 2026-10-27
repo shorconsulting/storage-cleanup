@@ -51,20 +51,33 @@ def cfg(**over):
 class FakeGitHub:
     ok = True
 
-    def __init__(self, pulls=None, branches=None, caches=None, artifacts=None, info=None):
+    def __init__(self, pulls=None, branches=None, caches=None, artifacts=None, info=None, infos=None, commits=()):
         self._pulls, self._branches = pulls or [], branches or []
         self._caches, self._artifacts = caches or [], artifacts or []
         self._info = info or {"default_branch": "main", "push": True, "archived": False}
+        self._infos = infos or {}  # slug -> info, or None for a repository GitHub does not serve (404)
+        self._commits = set(commits)  # (slug, sha) pairs GitHub has
         self.deleted = []
         self.now_open = {}  # branch -> open PR numbers that appear after planning
+        self.pulls_read = []
 
     def open_using(self, slug, name):
         return self.now_open.get(name, [])
 
     def info(self, slug):
+        if slug in self._infos:
+            if self._infos[slug] is None:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return self._infos[slug]
+        if self._infos:  # given per repository: any other one does not exist
+            raise RuntimeError("gh: Not Found (HTTP 404)")
         return self._info
 
+    def has_commit(self, slug, sha):
+        return (slug, sha) in self._commits
+
     def pulls(self, slug):
+        self.pulls_read.append(slug)
         return self._pulls
 
     def branches(self, slug):
@@ -881,6 +894,148 @@ class NestedRepositories(Fixture):
         self.assertTrue((d / ".git").exists())
 
 
+class MovedRepositories(Fixture):
+    """A checkout whose origin GitHub no longer serves is reported with the command that fixes it; nothing changes."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = cfg(remoteOwners=["Velocity-Org", "Shor-Consulting-Inc", "VAIVentures"])
+        self.head = sh(self.repo, "rev-parse", "HEAD")
+
+    def plan_for(self, gh):
+        repo = sc.Repo(self.repo)
+        repo.remote_url, repo.slug = "git@github.com:Velocity-Org/app.git", "Velocity-Org/app"
+        plan = sc.Plan()
+        sc.plan_repo(repo, self.cfg, gh, plan, set(), time.time(), "me", fetch=False)
+        return plan
+
+    def test_a_repository_gone_from_its_owner_is_found_under_another_with_the_same_history(self):
+        gh = FakeGitHub(infos={"Velocity-Org/app": None, "VAIVentures/app": {"full_name": "VAIVentures/app"}},
+                        commits=[("VAIVentures/app", self.head)])
+        plan = self.plan_for(gh)
+        self.assertEqual(len(plan.moved), 1)
+        m = plan.moved[0]
+        self.assertEqual((m["old"], m["new"], m["gone"], m["same"]), ("Velocity-Org/app", "VAIVentures/app", True, True))
+        self.assertIn("remote set-url origin git@github.com:VAIVentures/app.git", m["command"])  # same URL form
+        self.assertIn(str(self.repo), m["command"])
+        self.assertEqual(gh.pulls_read, [])  # a 404 repository is not asked for pull requests
+        self.assertEqual(sh(self.repo, "remote", "get-url", "origin"), str(self.origin))  # nothing was changed
+        text = sc.summarize(plan, "scan", [], [], (1, 2), (1, 2), sc.argparse.Namespace())
+        self.assertIn("Moved repositories", text)
+        self.assertNotIn("compare before switching", text)
+
+    def test_the_same_name_without_this_clones_commits_is_flagged(self):
+        gh = FakeGitHub(infos={"Velocity-Org/app": None, "VAIVentures/app": {"full_name": "VAIVentures/app"}})
+        m = self.plan_for(gh).moved[0]
+        self.assertEqual((m["new"], m["same"]), ("VAIVentures/app", False))
+
+    def test_a_repository_found_nowhere_is_listed_without_a_command(self):
+        plan = self.plan_for(FakeGitHub(infos={"Velocity-Org/app": None}))
+        self.assertEqual([(m["new"], m["command"]) for m in plan.moved], [("", "")])
+        text = sc.summarize(plan, "scan", [], [], (1, 2), (1, 2), sc.argparse.Namespace())
+        self.assertIn("Gone from GitHub", text)
+
+    def test_a_redirected_repository_is_moved_and_still_cleaned(self):
+        gh = FakeGitHub(infos={"Velocity-Org/app": {"full_name": "VAIVentures/app", "default_branch": "main"}})
+        plan = self.plan_for(gh)
+        m = plan.moved[0]
+        self.assertEqual((m["new"], m["gone"], m["same"]), ("VAIVentures/app", False, True))
+        self.assertEqual(gh.pulls_read, ["Velocity-Org/app"])  # GitHub redirects: merged-PR detection still works
+
+    def test_a_repository_in_place_or_an_error_other_than_404_is_not_moved(self):
+        here = FakeGitHub(infos={"Velocity-Org/app": {"full_name": "Velocity-Org/app"}})
+        self.assertEqual(self.plan_for(here).moved, [])
+
+        class Down(FakeGitHub):
+            def info(self, slug):
+                raise RuntimeError("gh: HTTP 502 Bad Gateway")
+        self.assertEqual(self.plan_for(Down()).moved, [])
+
+    def test_the_remote_pass_says_where_the_repository_went(self):
+        gh = FakeGitHub(infos={"Velocity-Org/app": None, "VAIVentures/app": {"full_name": "VAIVentures/app"}})
+        plan = sc.Plan()
+        sc.plan_remote("Velocity-Org/app", self.cfg, gh, plan, NOW)
+        self.assertIn("now at VAIVentures/app", plan.remote[0]["skipped"])
+        self.assertEqual(plan.actions, [])
+
+    def test_a_new_owner_missing_from_remote_owners_is_flagged(self):
+        self.cfg = cfg(remoteOwners=["Velocity-Org"])
+        gh = FakeGitHub(infos={"Velocity-Org/app": {"full_name": "SomewhereElse/app"}})
+        plan = self.plan_for(gh)
+        self.assertTrue(plan.moved[0]["unlisted"])
+        text = sc.summarize(plan, "scan", [], [], (1, 2), (1, 2), sc.argparse.Namespace())
+        self.assertIn("add SomewhereElse to remoteOwners first", text)
+
+    def test_one_repository_under_two_names_is_cleaned_on_github_once(self):
+        moved = {"full_name": "VAIVentures/app", "default_branch": "main", "push": True}
+        gh = FakeGitHub(infos={"Velocity-Org/app": moved, "VAIVentures/app": moved},
+                        branches=[{"name": "x", "sha": "1", "protected": False}],
+                        pulls=[dict(pr(1, "x", "1"), head_repo=None)])
+        plan = sc.Plan()
+        for slug in ("VAIVentures/app", "Velocity-Org/app"):
+            sc.plan_remote(slug, self.cfg, gh, plan, NOW)
+        self.assertEqual(len([a for a in plan.actions if a["kind"] == "remote-branch"]), 1)
+        self.assertIn("same repository as VAIVentures/app", plan.remote[1]["skipped"])
+
+    def test_a_redirected_repositorys_pull_requests_count_and_deletes_use_its_new_name(self):
+        info = {"full_name": "VAIVentures/app", "default_branch": "main", "push": True}
+        gh = FakeGitHub(infos={"Velocity-Org/app": info},
+                        branches=[{"name": "x", "sha": "1", "protected": False}],
+                        pulls=[dict(pr(1, "x", "1"), head_repo="VAIVentures/app")])
+        checked = []
+        gh.open_using = lambda slug, name: checked.append(slug) or []
+        plan = sc.Plan()
+        sc.plan_remote("Velocity-Org/app", self.cfg, gh, plan, NOW)
+        self.assertEqual(plan.remote[0]["repo"], "VAIVentures/app")
+        sc.execute(plan)
+        self.assertEqual(checked, ["VAIVentures/app"])  # the open-PR re-check filters on the current owner
+        self.assertEqual(gh.deleted, ["repos/VAIVentures/app/git/refs/heads/x"])
+        # and the checkout side counts that PR as this repository's own: its merged branch goes
+        sh(self.repo, "checkout", "-q", "-b", "agent/m")  # squash-merged: not in main, only the PR knows
+        sha = commit(self.repo, "side.txt")
+        sh(self.repo, "checkout", "-q", "main")
+        gh2 = FakeGitHub(infos={"Velocity-Org/app": info},
+                         pulls=[dict(pr(2, "agent/m", sha), head_repo="VAIVentures/app")])
+        self.assertIn(f"{self.repo} agent/m", self.targets(self.plan_for(gh2), "branch"))
+
+    def test_with_slug_keeps_the_url_form(self):
+        self.assertEqual(sc.with_slug("https://github.com/Velocity-Org/wyset.git", "Shor-Consulting-Inc/wyset"),
+                         "https://github.com/Shor-Consulting-Inc/wyset.git")
+        self.assertEqual(sc.with_slug("git@github.com:Velocity-Org/x", "VAIVentures/x"), "git@github.com:VAIVentures/x")
+
+
+class BrokenCheckouts(Fixture):
+    """A `.git` folder git cannot open (a half-deleted clone) is reported, never planned or counted as a failure."""
+
+    def broken(self):
+        path = self.tmp / "scratch" / "pr" / "app"
+        for d in ("objects/ab", "refs/heads", "hooks"):
+            (path / ".git" / d).mkdir(parents=True)
+        Path(path, ".git", "objects", "ab", "cdef").write_text("x" * 3000)
+        Path(path, "notes.txt").write_text("work")
+        return path
+
+    def test_a_clone_without_head_is_broken_and_a_healthy_one_is_not(self):
+        path = self.broken()
+        self.assertEqual(sc.broken_checkout(path), "no HEAD in .git")
+        self.assertIsNone(sc.broken_checkout(self.repo))
+
+    def test_a_broken_clone_is_reported_and_nothing_is_planned_for_it(self):
+        path = self.broken()
+        c = sc.load_config()
+        c.update(homes=[], roots=[str(self.tmp / "scratch"), str(self.tmp / "home")], tempRoots=[], postgres=[],
+                 crashDays=0)
+        args = sc.argparse.Namespace(home=None, local_only=True, remote_only=False, no_caches=True)
+        plan, _, repos = sc.build_plan(args, c, None)
+        self.assertEqual([os.path.realpath(str(r.path)) for r in repos], [os.path.realpath(str(self.repo))])
+        self.assertEqual([(x["path"], x["why"]) for x in plan.broken], [(str(path), "no HEAD in .git")])
+        self.assertGreater(plan.broken[0]["bytes"], 0)
+        self.assertNotIn(str(path), " ".join(a["target"] for a in plan.actions))
+        self.assertTrue(path.joinpath("notes.txt").exists())
+        text = sc.summarize(plan, "scan", [], [], (1, 2), (1, 2), sc.argparse.Namespace())
+        self.assertIn("Broken checkouts", text)
+
+
 class Discovery(unittest.TestCase):
     def test_finds_repos_and_skips_heavy_and_hidden_folders(self):
         root = Path(tempfile.mkdtemp(prefix="sc-find-"))
@@ -1030,6 +1185,22 @@ class Report(unittest.TestCase):
         self.assertIn("Cleaned, 1 failed", bad)
         self.assertIn("contains modified files", bad)
 
+    def test_moved_and_broken_sections(self):
+        rep = sample_report()
+        rep["moved"] = [{"path": "/Users/dgshor/claude/VAIVentures/<x>", "account": "dgshor", "old": "Velocity-Org/x",
+                         "new": "VAIVentures/x", "gone": True, "same": False,
+                         "command": "git -C '/Users/dgshor/claude/VAIVentures/<x>' remote set-url origin u"},
+                        {"path": "/w", "account": "dgshor", "old": "Velocity-Org/y", "new": "", "gone": True,
+                         "same": False, "command": ""}]
+        rep["broken"] = [{"path": "/tmp/s/pr/app", "bytes": sc.MB, "modified": "2026-10-24", "why": "no HEAD in .git"}]
+        page = sc.render_html(rep)
+        self.assertIn("Moved repositories", page)
+        self.assertIn("compare first", page)
+        self.assertIn("not found", page)
+        self.assertNotIn("<x>", page)
+        self.assertIn("Broken checkouts", page)
+        self.assertIn("no HEAD in .git", page)
+
     def test_test_and_dry_run_never_clean(self):
         ns = sc.argparse.Namespace
         self.assertEqual(sc.run_mode(ns(cmd="test")), "scan")
@@ -1059,7 +1230,9 @@ class AllAccounts(unittest.TestCase):
         rep = {"actions": [{"kind": "build", "target": "/Users/dgshor/claude/a/node_modules", "bytes": 5,
                             "why": "idle", "home": "dgshor", "status": "done"}],
                "kept": [], "loose": [], "notes": ["n"], "needs": {"aiuser2": ["worktree w"]}}
+        rep["broken"], rep["moved"] = [{"path": "/b"}], [{"path": "/m"}]
         sc.merge_accounts(plan, {"dgshor": rep}, ["could not run as aiuser2 through sudo"])
+        self.assertEqual((plan.broken, plan.moved), ([{"path": "/b"}], [{"path": "/m"}]))
         self.assertEqual(len(plan.actions), 1)
         self.assertNotIn("dgshor", plan.needs)
         self.assertEqual(plan.needs["aiuser2"], ["npm cache 2 GB", "worktree w"])
@@ -1120,6 +1293,21 @@ class AllAccounts(unittest.TestCase):
         self.assertEqual(calls, [("call", ["sudo", "-v"]), ("run", "aiuser1"),
                                  ("call", ["sudo", "-v"]), ("run", "aiuser2")])
 
+    def test_accounts_sudo_could_not_run_get_one_command_any_account_can_run(self):
+        real_run, real_have = sc.subprocess.run, sc.have
+        sc.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="")  # sudo: password needed
+        sc.have = lambda tool: True if tool == "sudo" else real_have(tool)
+        try:
+            reports, notes = sc.run_accounts(sc.argparse.Namespace(), "clean", ["dgshor", "aiuser2"])
+        finally:
+            sc.subprocess.run, sc.have = real_run, real_have
+        self.assertEqual(reports, {})
+        self.assertEqual(len(notes), 1)
+        self.assertIn("could not run as dgshor, aiuser2 through sudo", notes[0])
+        # the shared copy every account can read, never this file inside the starting account's home
+        self.assertIn(f"storage-cleanup-{os.getuid()}/storage_cleanup.py clean --all-accounts", notes[0])
+        self.assertNotIn(str(Path(sc.__file__).resolve()), notes[0])
+
     def test_no_sudo_means_a_note_not_a_crash(self):
         real = sc.have
         sc.have = lambda tool: False if tool == "sudo" else real(tool)
@@ -1148,6 +1336,27 @@ class Helpers(unittest.TestCase):
     def test_human(self):
         self.assertEqual(sc.human(512), "512 B")
         self.assertEqual(sc.human(3 * sc.GB), "3.0 GB")
+
+    def test_cloud_sessions_are_recognised(self):
+        self.assertIsNone(sc.cloud_session({}))
+        self.assertIsNone(sc.cloud_session({"CLAUDE_CODE_REMOTE": "false", "CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE": ""}))
+        self.assertIn("CLAUDE_CODE_REMOTE", sc.cloud_session({"CLAUDE_CODE_REMOTE": "true"}))
+        self.assertIn("ENVIRONMENT_TYPE", sc.cloud_session({"CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE": "cloud"}))
+
+    def test_a_run_in_a_cloud_session_is_refused_before_anything_happens(self):
+        runs = sc.HOME / "runs.jsonl"
+        before = runs.read_text() if runs.exists() else None
+        saved = os.environ.get("CLAUDE_CODE_REMOTE")
+        os.environ["CLAUDE_CODE_REMOTE"] = "true"
+        try:
+            self.assertEqual(sc.main(["clean", "--quiet"]), 4)
+            self.assertEqual(sc.main(["test", "--quiet", "--remote-only"]), 4)
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_CODE_REMOTE")
+            else:
+                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        self.assertEqual(runs.read_text() if runs.exists() else None, before)  # no run was recorded
 
     def test_homes_skip_accounts_that_do_not_exist(self):
         c = sc.load_config()
